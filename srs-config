@@ -1,0 +1,255 @@
+#!/usr/bin/env python
+# $Id: srs-config 625 2013-09-24 21:46:06Z janin $
+#
+# Copyright 2012, 2013 International Computer Science Institute
+# See the file LICENSE for licensing terms.
+#
+# Configuration handling for the System for Running Systems.
+#
+# For documentation and tutorial, see doc subdirectory.
+#
+# Versions
+#
+# Initial version: Feb 28, 2012 Adam Janin
+#
+# Version 0.2: April 3, 2012 Adam Janin
+# 
+# Modified for version 0.2 of srs.py.
+#
+# Version 0.3: April 12, 2012 Adam Janin
+# 
+# Added -dump option that dumps all the variables in a file.
+#
+# Version 0.4: February 1, 2013 Adam Janin
+#
+# Added -dumpsh option that outputs commands suitable for use with
+# eval in the bourne shell.
+#
+# Added -dumpcsh option for use with csh.
+#
+# Added -dumpmatlab option for use with matlab.
+#
+# Version 0.5: March 20, 2013 Adam Janin
+#
+# Added -dumpperl for use with perl. It's a bit different in that
+# it loads a perl hash.
+#
+# TODO
+#
+#
+
+VERSION = 0.5
+
+import sys
+import logging
+import argparse
+import os
+
+import srs
+
+class State:
+    '''Stores local state information for this script. There should be no instances of State.'''
+
+    # Top level config files. Set in parse_arguments()
+    # from either command line or environment variable
+    
+    configfiles = None
+
+    # If set, the string to return if the variable isn't
+    # defined in the config file.
+    
+    default = None
+
+    # If True, do not print anything; rather, return
+    # exit code 0 if the key exists and 1 if it does not.
+
+    quiet = False
+
+    # The key we're looking for. Set in parse_arguments()
+    key = None
+
+    # If True, return the docstring rather than the value
+    doc = False
+    
+    # Log level. Set in parse_arguments()
+    loglevel = None
+
+    # If True, dump all values rather than looking up key.
+    dump = False
+
+    # If not None, write commands to stdout suitable for use
+    # with bourne shell's eval. The value of this variable
+    # should be a string that's prefixed to each variable.
+    dumpsh = None
+
+    # Same as dumpsh but for use with csh
+    dumpcsh = None
+
+    # Same for matlab
+    dumpmatlab = None
+
+    # If not None, names the perl hash to store variables into
+    dumpperl = None
+
+    # Name of this program. Set by main()
+    progname = None
+# end class State
+
+######################################################################
+
+def main(argv):
+    State.progname = argv[0]
+    parse_arguments(argv[1:])
+
+    #########
+    ### get SRS folder
+    srsDirectory = srs.which('srs-go')
+    if srsDirectory is None:
+        logging.error('SRS-GO is not found in PATH directories')
+        sys.exit(1)
+    #########
+    ### set environment variables
+    os.environ['PATH'] = srsDirectory + ':' + os.environ['PATH']
+    os.environ['PYTHONPATH'] = srsDirectory + ':' + os.environ['PATH']
+    os.environ['SWORDFISH_ROOT'] = srsDirectory
+
+    #########
+    ### create srs-go.config
+    if os.path.exists('srs-go.config') == False:
+        fdConfig = open('srs-go.config', 'w')
+        fdConfig.write('# this file should exist.')
+        fdConfig.close()
+
+    setup_logging()
+
+    if State.key is None:
+        if not State.dump and State.dumpsh is None and State.dumpcsh is None and State.dumpmatlab is None and State.dumpperl is None:
+            logging.error('You must either provide key or use one of the -dump options')
+            sys.exit(1)
+    else:
+        if State.dump or State.dumpsh is not None or State.dumpcsh is not None or State.dumpmatlab is not None or State.dumpperl is not None:
+            logging.error('If you use one of the -dump options, you may not specify a key')
+            sys.exit(1)
+
+    ndump = 0
+    if State.dump:
+        ndump += 1
+    if State.dumpsh is not None:
+        ndump += 1
+    if State.dumpcsh is not None:
+        ndump += 1
+    if State.dumpmatlab is not None:
+        ndump += 1
+    if State.dumpperl is not None:
+        ndump += 1
+    if ndump > 1:
+        logging.error('You may only use one of the -dump options at a time')
+        sys.exit(1)
+
+    if State.configfiles is None or State.configfiles == []:
+        e = os.getenv('SRS_CONFIG')
+        if e is None:
+            logging.error('Missing config file. Either use -config configfile or set $SRS_CONFIG environment variable.')
+            sys.exit(1)
+        else:
+            State.configfiles = [e]
+
+    try:
+        config = srs.Config(*State.configfiles)
+    except srs.MacroError as err:
+        logging.error('%s', err)
+        return 1
+
+    if State.dump:
+        config.write(sys.stdout, withcomments=State.doc)
+        return 0
+
+    if State.dumpsh is not None:
+        config.dumpsh(State.dumpsh)
+        return 0
+
+    if State.dumpcsh is not None:
+        config.dumpcsh(State.dumpcsh)
+        return 0
+
+    if State.dumpmatlab is not None:
+        config.dumpmatlab(State.dumpmatlab)
+        return 0
+
+    if State.dumpperl is not None:
+        config.dumpperl(State.dumpperl)
+        return 0
+
+    if State.default is None and State.key not in config:
+        if not State.quiet:
+            logging.error('Failed to find key %s in config file(s) %s.',
+                          State.key, ', '.join(State.configfiles))
+        return 1
+
+    if not State.quiet:
+        if State.doc:
+            if State.key in config:
+                print config.getdocstring(State.key)
+            # Take no action if default is given but key doesn't exist
+        else:
+            if State.key in config:
+                print config.get(State.key)
+            else :
+                # We checked above already for State.default is None
+                print State.default
+
+    return 0
+# end main()
+
+
+def setup_logging():
+    numeric_level = getattr(logging, State.loglevel, None)
+    if not isinstance(numeric_level, int):
+        raise ValueError('Invalid log level: %s' % loglevel)
+    logging.basicConfig(level=numeric_level, format="%(module)s:%(levelname)s: %(message)s")
+
+def parse_arguments(strs):
+    parser = argparse.ArgumentParser(description='System for Running Systems Configuration Handler. Program version %s, library version %s.'%(VERSION,srs.VERSION))
+
+    parser.add_argument('-config', dest='configfiles', action='append',
+                        help='Initial configuration file. Can appear more than once, in which case they are searched in order. Defaults to env variable $SRS_CONFIG')
+    parser.add_argument('-default', help='Default string to return if no match is found for key.')
+    parser.add_argument('-quiet', help='Do not print result. Just return with exit code 0 if the key exists, and 1 otherwise.', action='store_true')
+    parser.add_argument('-loglevel', 
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        default='WARNING',
+                        help='Logging level (default %(default)s)')
+    parser.add_argument('-doc', action='store_true', help='Return documentation string rather than value')
+    parser.add_argument('-dump', action='store_true', help='Dump all variables')
+    parser.add_argument('-dumpsh', metavar='prefix', help='Dump commands suitable for use with Bourne shell\'s eval command. The argument to -dumpsh is prepended to the names of the config variables.', nargs='?', const='')
+    parser.add_argument('-dumpcsh', metavar='prefix', help='Dump commands suitable for use with csh\'s eval command. The argument to -dumpcsh is prepended to the names of the config variables.', nargs='?', const='')
+    parser.add_argument('-dumpmatlab', metavar='prefix', help='Dump commands suitable for use with matlab\'s eval command. The argument to -dumpmatlab is prepended to the names of the config variables.', nargs='?', const='')
+    parser.add_argument('-dumpperl', metavar='hashname', help='Dump commands suitable for use with perl\'s eval command. The argument to -dumpperl is the name of a hash that config variables are stored into.', nargs='?', const='_')
+    parser.add_argument('-version', '--version', action='version', version="%s $Id: srs-config 625 2013-09-24 21:46:06Z janin $"%VERSION)
+    parser.add_argument('key', nargs='?', help='Key to look up')
+
+    args = parser.parse_args(strs)
+
+    State.configfiles = args.configfiles
+    State.default = args.default
+    State.loglevel = args.loglevel
+    State.key = args.key
+    State.dump = args.dump
+    State.dumpsh = args.dumpsh
+    State.dumpcsh = args.dumpcsh
+    State.dumpmatlab = args.dumpmatlab
+    State.dumpperl = args.dumpperl
+
+    if args.quiet:
+        State.quiet = True
+    else:
+        State.quiet = False
+
+    if args.doc:
+        State.doc = True
+    else:
+        State.doc = False
+# end parse_arguments()
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

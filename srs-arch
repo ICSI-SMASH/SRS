@@ -1,0 +1,46 @@
+#!/bin/bash
+# $Id: srs-arch 625 2013-09-24 21:46:06Z janin $
+#
+# Copyright 2012, 2013 International Computer Science Institute
+# See the file LICENSE for licensing terms.
+#
+# Print out a tag representing the machine architecture.
+#
+# Inspired by speech_arch at ICSI.
+#
+# Note one difference from speech_arch is that srs-arch doesn't use
+# defaults. If it can't be sure of the version, you get unknown.
+#
+# The value returned (e.g. x86_64-linux) is used for naming
+# architecture specific directories such as:
+# /u/drspeech/projects/swordfish/x86_64-linux/bin
+# /u/drspeech/projects/swordfish/x86_64-linux/lib
+#
+
+arch=unknown
+
+case `/bin/uname` in
+SunOS)
+    case `/bin/uname -r` in
+    5.*) 
+        arch=sun4-sunos5;
+	;;
+    esac;;
+Linux)
+    case `/bin/uname -m` in 
+    i686)
+	arch="i686-linux"
+	;;
+    x86_64)
+	arch="x86_64-linux"
+	;;
+    esac;;
+esac
+
+echo $arch
+if [ $arch == 'unknown' ]; then
+    false
+else
+    true
+fi
+

@@ -1,0 +1,947 @@
+#!/usr/bin/env python
+# $Id: srs-go 629 2013-09-27 18:39:21Z janin $
+#
+# File: srs-go
+# Copyright 2012, 2013 International Computer Science Institute
+# See the file LICENSE for licensing terms.
+#
+# System for Running Systems execution engine.
+#
+# Copies a template to a new directory, and executes the steps
+# within it. Also provides data storage and logging facilities.
+# For documentation see "doc" subdirectory.
+#
+# See CHANGELOG.srs-go for information on versions.
+#
+# See TODO.srs-go for notes on possible future changes/fixes.
+#
+
+VERSION = 0.4
+
+import sys
+import logging
+import shutil
+import argparse
+import os
+import os.path
+import string
+import datetime
+import subprocess
+import threading
+import time
+import base64
+import hashlib
+import socket
+
+import srs
+
+class State:
+    '''Stores state information for this program. There should be no instances of State.'''
+
+    # Command line arguments.
+    # All of these should always be assigned in parse_arguments()
+    # Directory args (e.g. template, topdir, configfile) are converted
+    # to absolute paths.
+
+    configfiles = None
+    template = None
+    topdir = None
+    fromstep = None
+    tostep = None
+    loglevel = None
+    timeout = None
+    retries = None
+
+    # Initial extra config options from command line.
+    # This should be a list with an even number of elements
+    # [name1 val1 name2 val2 ...]
+    extraconfig = None
+
+    # Where the current step INPUT file should come from. Note
+    # that the OUTPUT file is is stored as OUTCONFIG.stepN in the
+    # configpath_template directory. This is set initially to
+    # a config file constructed from the command line arguments
+    # (if any) followed by an INCLUDE of the file specified
+    # with -config.
+    step_input_config = None
+
+    # What operation to perform. One of -cleandata, -cleanall, or None
+    # (for normal operation). Set in parse_arguments based on flags.
+    operation = None
+
+    # If -restart was provided, ignore DONE processing and just run
+    # all steps.
+    restart = False
+
+    # Name of the program. Used to substitute into $PROG in
+    # naming templates. Must be set in main()
+    progname = None
+
+    # Hash of the template path, the directory path, and the USER.
+    # Used in creation of the data directories, and set in main().
+    hash = None
+
+    # False if we're before fromstep or after tostep, True otherwise.
+    # It defaults to True and is only set to false if -from fromstep
+    # was provided on the command line, in which case parse_arguments
+    # sets it to false.
+    step_in_range = True
+
+    # Processing of a step is skipped if a matching DONE.stepX
+    # file exists in the corresponding log directory. As soon
+    # as a DONE.stepX does NOT exist, seen_not_done is set to True
+    # and we thereafter force execution regardless of the DONE.stepX
+    # status. This ensures that, if step(x) fails, step(x) and all
+    # step(x+i) are rerun.
+    seen_not_done = False
+
+    # Set to True if there is a DONE.stepX, the step is in range,
+    # and we haven't failed to see a DONE.stepX in previous steps.
+    already_done = False
+
+    # Directory where system files and directories are stored for each
+    # step. Currently set in main to the program name in upper case.
+    sysdir_name = None
+
+    # List of links that will be created in the data directory.
+    # Must be defined in the config files, srs-go.config,
+    # or the command line. The format in the config file is e.g.:
+    #  srs_go_data_directories scratch scratch_ttmp scratch_local_ttmp
+    data_directories = [ ]
+
+    # The data directory paths must be defined in the config files.
+    # There must be an entry like srs_go_data_path_X for each X
+    # in srs_go_data_directories.
+    #
+    # Data directories are created when a step is traversed. These
+    # templates are filled in at that time.
+    #
+    # Good values at ICSI might be:
+    #    scratch_local_ttmp: /tscratch/tmp
+    #    scratch_ttmp: /u/drspeech/ttmp
+    #    scratch: /u/drspeech/data/swordfish/users
+    #
+    # For sites without specialized disks:
+    #    scratch_local_ttmp: /tmp/$USER
+    #    scratch_ttmp: /home/$USER/ttmp
+    #    scratch: /home/$USER/tmp
+
+    data_directory_path = { }
+
+    # The following variables are expanded when encountered:
+    #
+    # $HASH - a hash of the template, the top directory, and the user
+    # $PROG - progname, the name of this program (e.g. srs-go)
+    # $SYS  - sysdir_name, usually progname in all uppercase
+    # $USER - username from USER env variable
+    # $TOP  - topdir, the -dir argument 
+    # $HOST - host srs-go runs on from socket.gethostname
+    # $NOW  - timestamp
+    # $STEP - path to the current step
+    #
+
+    # The data directory is created under data_directory_path/data_directory_suffix
+    data_directory_suffix = '$USER/$PROG/$HASH/$STEP';
+
+    # Template for where to store logs.
+    logpath_template = '$TOP/$STEP/../$SYS/logs'
+
+    # Template of where data directories will get stored.
+    datapath_template = '$TOP/$STEP/../$SYS/data'
+
+    # Template of directory where config files are stored.
+    configpath_template = '$TOP/$STEP/../$SYS/config'
+
+    # Store the current configuration variables
+    cf = None
+
+# end class State
+    
+######################################################################
+
+def main(argv):
+    State.progname = os.path.basename(argv[0])
+    State.sysdir_name = State.progname.upper()
+
+    parse_arguments(argv[1:])
+
+    # Read config files. Also sets State.data_directories, State.data_directory_path, etc.
+    read_config()
+
+    # Set the State.template variable from command line, config, or previous run.
+    # Also sets State.cf's srs_go_config
+    set_template()
+
+    # Compute the hash based on template, directory, and user.
+
+    hashin = \
+        "-template " + State.template + \
+        " -dir " + State.topdir + \
+        " -user " + os.environ['USER']
+    hashout = base64.urlsafe_b64encode(hashlib.md5(hashin).digest())
+    State.hash = hashout[0:12]
+
+    # If -cleandata, clean the data.
+    # If -cleanall, clean the data and remove everything under topdir
+
+    if State.operation == '-cleandata' or State.operation == '-cleanall':
+        if not os.path.exists(State.topdir) or os.listdir(State.topdir) == []:
+            return 0
+        oldmachine = open(os.path.join(get_logpath('TOP'), 'HOSTNAME.log')).read()
+        curmachine = socket.gethostname()
+        if oldmachine != curmachine:
+            logging.info('Restarting command on the %s, where it was originally run.', oldmachine)
+            cmd = 'ssh -n %s \'cd %s; %s\''%(oldmachine, os.getcwd(), ' '.join(sys.argv))
+            return subprocess.call(cmd, shell=True)
+                                   
+        # We're on the same machine. Actually do the clean.
+        cleandata('.')
+        if State.operation == '-cleanall':
+            logging.info('Deleting everything under %s', State.topdir)
+            try:
+                shutil.rmtree(State.topdir)
+            except OSError as err:
+                logging.error('Unable to delete %s: %s', State.topdir, err.strerror)
+                sys.exit(-1)
+        return 0
+
+    # Copy template if needed.
+    copy_template(State.template, State.topdir)
+
+    # Create directories for command line log and config files
+    create_sys_directory('.')
+    create_log_directory('.')
+    create_config_directory('.')
+
+    write_commandline_log()
+    write_hostname_log()
+    write_master_config()
+    write_commandline_config()
+
+    State.step_input_config = get_master_config_file()
+
+    #########
+    ### get SRS folder
+    srsDirectory = srs.which('srs-go')
+    if srsDirectory is None:
+        logging.error('SRS-GO is not found in PATH directories')
+        sys.exit(1)
+    #########
+    ### set environment variables
+    os.environ['PATH'] = srsDirectory + ':' + os.environ['PATH']
+    os.environ['PYTHONPATH'] = srsDirectory + ':' + os.environ['PATH']
+    os.environ['SWORDFISH_ROOT'] = srsDirectory
+
+    #########
+    ### create srs-go.config
+    if os.path.exists('srs-go.config') == False:
+        fdConfig = open('srs-go.config', 'w')
+        fdConfig.write('# this file should exist.')
+        fdConfig.close()
+
+    if run_directory_step('.'):
+        return 0
+    else:
+        return 1
+# end main()
+
+def read_config():
+    '''Read first from command line, then -config file arguments, and then from srs-go.config for variables that control srs-go itself. Store in State. srs-go.config must be in the same directory as the srs-go script'''
+
+    # Read config files and variables. Note that we first read any files,
+    # and we then OVERWRITE with any "extra" config variables from the
+    # command line.
+
+    # Config files from the command line
+    configlist = list(State.configfiles)
+
+    # Then any files listed in environment variable SRS_GO_CONFIG,
+    # which must be a colon separated list of paths.
+    if 'SRS_GO_CONFIG' in os.environ:
+        elist = os.environ['SRS_GO_CONFIG'].split(':')
+        for f in elist:
+            if not os.path.exists(f):
+                logging.error("Config file '%s' from environment variable SRS_GO_CONFIG doesn't exist."%(f))
+                sys.exit(1)        
+        configlist.extend(elist)
+
+    # Then ~/.srs-go.config, if any
+    userconfig=os.path.expanduser("~/.srs-go.config")
+    if os.path.exists(userconfig):
+        configlist.append(userconfig)
+
+    # Then srs-go.config, which must be in the same directory as this file (srs-go)
+    srsconfig = os.path.join(os.path.dirname(os.path.realpath(os.path.abspath(__file__))), "srs-go.config");
+    if not os.path.exists(srsconfig):
+        logging.error("Could not find srs-go config file '%s'"%(srsconfig))
+        sys.exit(1)
+    configlist.append(srsconfig)
+    #print 'jooddang: ' , configlist
+
+    cf = srs.Config(*configlist)
+
+    # Now overwrite with command line (if any)
+    for ii in range(0, len(State.extraconfig), 2):
+        cf.set(State.extraconfig[ii], State.extraconfig[ii+1])
+        cf.adddoc(State.extraconfig[ii], '', filename='[Command line]', linenumber=ii/2)
+
+    # Set up State.data_directories and State.data_directory_path
+    c = cf.vars
+    if 'srs_go_data_directories' not in cf:
+        logging.info('srs_go_data_directories is not defined. No data directories will be created')
+    else:
+        State.data_directories = string.split(c.srs_go_data_directories)
+        for datadir in State.data_directories:
+            cfvar = 'srs_go_data_path_' + datadir
+            if cfvar in cf:
+                State.data_directory_path[datadir] = c[cfvar]
+            else:
+                logging.warning('%s is listed in srs_go_data_directories, but %s is not defined'%(datadir, cfvar))
+                State.data_directory_path[datadir] = 'None'
+
+    # Store in State
+    State.cf = cf
+# end read_config()
+
+def run_step(curstep):
+    if not all(ord(c) < 128 for c in curstep):
+        logging.error('Step %s contains non-ascii characters. To ensure sort order is deterministic, all steps must be ascii only. Sorry.'%(curstep))
+        sys.exit(1)
+    path = os.path.join(State.topdir, curstep)
+
+    # Update step_in_range status based on fromstep.
+
+    if not State.step_in_range and State.fromstep is not None and os.path.abspath(curstep) == os.path.abspath(State.fromstep):
+        State.step_in_range = True
+        logging.info('Beginning execution at -from %s', State.fromstep)
+
+    State.already_done = False
+    if State.step_in_range:
+        if done_exists(curstep):
+            if not State.seen_not_done:
+                State.already_done = True
+        elif not os.path.isdir(path):
+            State.seen_not_done = True
+
+    if os.path.isdir(path):
+        retval = run_directory_step(curstep)
+    else:
+        retval = run_file_step(curstep, path)
+
+    # Write out contents of STDOUT logfile for debugging
+    stdoutlog_basename = 'STDOUT.'+os.path.basename(curstep)
+    stdoutlog_path = os.path.join(get_logpath(curstep), stdoutlog_basename) 
+    if os.path.exists(stdoutlog_path):
+        for line in open(stdoutlog_path):
+            logging.debug("%s: %s" % (stdoutlog_basename, line.strip()))
+ 
+    # Write out contents of STDERR logfile for warning, or error if exiting
+    stderrlog_basename = 'STDERR.'+os.path.basename(curstep)
+    stderrlog_path = os.path.join(get_logpath(curstep), stderrlog_basename) 
+    if os.path.exists(stderrlog_path):
+        for line in open(stderrlog_path):
+            if not retval:
+                logging.error("%s: %s" % (stderrlog_basename, line.strip()))
+            else:
+                logging.warning("%s: %s" % (stderrlog_basename, line.strip()))
+
+    if not retval:
+        sys.exit(1)
+
+    # Update step_in_range status based on tostep.
+
+    if State.step_in_range and State.tostep is not None and os.path.abspath(curstep) == os.path.abspath(State.tostep):
+        State.step_in_range = False
+        logging.info('Ending executing at -to %s', State.tostep)
+        # Can we stop altogether here?!?
+
+    return retval
+# end run_step()
+
+def should_run_step(curstep):
+    '''Return True if the State is in the state such that the step should be run'''
+    return State.step_in_range and not State.already_done
+# end should_run_step()
+
+def run_directory_step(curstep):
+    '''Run a directory step. This runs even if we're not executing, since substeps may execute.'''
+
+    logging.info('Traversing directory step %s', curstep)
+    path = os.path.abspath(os.path.join(State.topdir, curstep))
+    try:
+        os.chdir(path)
+    except OSError as err:
+        logging.error('Unable to change to directory %s: %s',
+                      path, err.strerror)
+        sys.exit(1)
+
+    if not done_exists(curstep):
+        create_sys_directory(curstep)
+        create_log_directory(curstep)
+        create_config_directory(curstep)
+        create_data_directories(curstep)
+        if curstep != '.':
+            start_logs(curstep)
+
+    # Default to True in case no substep executes
+    retval = True
+
+    # For each file/directory that starts with 'step' in sorted order...
+    for fname in sorted([f for f in os.listdir(path) if f.startswith('step') and not f.endswith('~')]):
+        # If any substep fails, consider it failed.
+        retval = retval & run_step(os.path.join(curstep, fname))
+
+    if not done_exists(curstep) and curstep != '.':
+        finish_logs(curstep, retval)
+
+    return retval
+# end run_directory_step()
+
+def run_file_step(curstep, path):
+    retval = True
+    dirstep = os.path.dirname(path)
+    basestep = os.path.basename(curstep)
+    inconfig = os.path.abspath(State.step_input_config)
+    outconfig = os.path.abspath(os.path.join(get_configpath(curstep), 'OUTCONFIG.' + basestep))
+
+    # First of all, make sure you're in the right directory!
+    try:
+        os.chdir(dirstep)
+    except OSError as err:
+        logging.error('Unable to change to directory %s: %s',
+                      dirstep, err.strerror)
+        sys.exit(1)
+
+    if not State.already_done:
+        # Write the default outconfig as just including the inconfig
+        with open(outconfig, 'w') as f:
+            print >>f, 'INCLUDE', inconfig
+            
+    if should_run_step(curstep):
+        start_logs(curstep)
+        logging.info('Running file step %s %s %s', curstep, inconfig, outconfig)
+        retval = execute_file_step(curstep, path, inconfig, outconfig)
+        finish_logs(curstep, retval)
+    else:
+        logging.info('Skipping file step %s', curstep)
+    State.step_input_config = outconfig
+    return retval
+# end run_file_step()
+
+def execute_file_step(curstep, path, inconfig, outconfig):
+    '''Run the step, capturing stdout and stderr to the appropriate log file. Retries up to State.retries times.'''
+    
+    # Set up stdout and stderr files in the log directory
+
+    logpath = get_logpath(curstep)
+    basestep = os.path.basename(curstep)
+
+    stdoutpath = os.path.join(logpath, 'STDOUT.' + basestep)
+    stderrpath = os.path.join(logpath, 'STDERR.' + basestep)
+
+    for tryi in range(0,1+State.retries):
+        if tryi > 0:
+            logging.error('Retrying %s, try %d'%(curstep, tryi))
+            os.rename(stdoutpath, stdoutpath+'.try%d'%(tryi))
+            os.rename(stderrpath, stderrpath+'.try%d'%(tryi))
+
+        cmd = CallWithTimeout('%s \'%s\' \'%s\''%(path,inconfig,outconfig),
+                              stdoutpath, stderrpath, State.timeout)
+        
+        # Print logging messages on timeout or non-zero return code.
+        if cmd.timedout:
+            logging.error('%s timed out after %d seconds'%(curstep, State.timeout))
+        elif cmd.returncode != 0:
+            logging.error('%s returned non-zero exit status %d. See %s.', curstep, cmd.returncode, stderrpath)
+        else:
+            if tryi > 0:
+                logging.error('%s succeeded on try %d'%(curstep, tryi))
+            return True
+    return False
+# end execute_file_step()
+
+def create_sys_directory(curstep):
+    destpath = os.path.abspath(os.path.join(os.path.join(State.topdir, curstep), State.sysdir_name))
+    if not os.path.exists(destpath):
+        try:
+            os.mkdir(destpath)
+        except OSError as err:
+            logging.error('Could not create system directory %s: %s',
+                          destpath, err.strerror)
+            sys.exit(1)
+# end create_sys_directory()
+    
+def create_data_directories(curstep):
+    '''
+    Create all the data directories and their links.
+    
+    Note that the local directories will only be created on the local machine. If a template is undefined in the config file or defined as the string None, info will be logged and no directory will be created. Otherwise, an error will be reported if the directory cannot be created.
+
+    See comments in srs-go.State for available variables.
+    '''
+
+    datapath = get_datapath(os.path.join(curstep, 'data'))
+    if not os.path.exists(datapath):
+        try:
+            os.mkdir(datapath)
+            ##########
+            ## scratch folders
+            os.mkdir(os.path.join(datapath, 'scratch_local_ttmp'))
+            os.mkdir(os.path.join(datapath, 'scratch_ttmp'))
+        except OSError as err:
+            logging.error('Could not create data directory %s: %s',
+                          datapath, err.strerror)
+            sys.exit(1)
+                            
+    for link, dest in State.data_directory_path.iteritems():
+        create_data_directory(curstep, os.path.join(datapath, link), dest)
+# end create_data_directories()
+
+def create_data_directory(curstep, link, desttop):
+    '''Create one data directory and the link to it. See create_data_directories for more info.'''
+    if desttop == 'None':
+        logging.info('Not creating data directory "%s" because the path for it is undefined or set to None.' % (link))
+        return
+        
+    destpath = os.path.abspath(fill_template_string(os.path.join(desttop, State.data_directory_suffix), curstep))
+    path = os.path.abspath(os.path.join(State.topdir, curstep))
+    if not os.path.exists(destpath):
+        try:
+            os.makedirs(destpath)
+        except OSError as err:
+            logging.error('Could not create directory %s for link %s: %s',
+                          destpath, link, err.strerror)
+            sys.exit(1)    
+        logging.debug('Created directory %s for link %s', destpath, link)
+    if not os.path.exists(link):
+        try:
+            os.symlink(destpath, link)
+        except OSError as err:
+            logging.error('Could not create link %s to directory %s: %s',
+                          link, destpath, err.strerror)            
+            sys.exit(1)
+    backlink = os.path.join(destpath, State.progname + '-dir')
+    if not os.path.exists(backlink):
+        try:
+            os.symlink(path, backlink)
+        except OSError as err:
+            logging.error('Could not create back link %s to directory %s: %s',
+                          backlink, path, err.strerror)
+            sys.exit(1)
+# end create_data_directory()
+
+def get_logpath(curstep):
+    return os.path.abspath(fill_template_string(State.logpath_template, curstep))
+
+def get_datapath(curstep):
+    return os.path.abspath(fill_template_string(State.datapath_template, curstep))
+
+def get_configpath(curstep):
+    return os.path.abspath(fill_template_string(State.configpath_template, curstep))
+
+def get_master_config_file():
+    return os.path.abspath(os.path.join(get_configpath('TOP'), 'MASTER.config'))
+
+def get_commandline_config_file():
+    return os.path.abspath(os.path.join(get_configpath('TOP'), 'COMMANDLINE.config'))
+
+def write_commandline_log():
+    fn = os.path.join(get_logpath('TOP'), 'COMMANDLINE.log')
+    with open(fn, 'w') as f:
+        s = fill_template_string('$PROG called on $NOW by user $USER on $HOST', 'TOP')
+        print >>f, '# ', s, "\n"
+        logging.info(s)
+        s = ' '.join(sys.argv)
+        print >>f, s
+        logging.info('Command Line: '+s)
+# end write_commandline_log()
+
+def write_hostname_log():
+    fn = os.path.join(get_logpath('TOP'), 'HOSTNAME.log')
+    with open(fn, 'w') as f:
+        f.write(socket.gethostname())
+
+def write_master_config():
+    with open(get_master_config_file(), 'w') as f:
+        print >>f, '# Automatically generated master configuration file consisting of the variables\n# from the command line and the variables in the -config file.\n#\n#',
+        print >>f, fill_template_string('$PROG called on $NOW by user $USER on $HOST\n', 'TOP')
+        State.cf.write(f, True)
+# end write_master_config()
+
+def write_commandline_config():
+    with open(get_commandline_config_file(), 'w') as f:
+        print >>f, '# Automatically generated configuration file containing the command line arguments.'
+        print >>f, 'template', State.template
+        print >>f, 'config', ' '.join(State.configfiles)
+        print >>f, 'dir', State.topdir
+        print >>f, 'loglevel', State.loglevel
+        if len(State.extraconfig) > 0:
+            print >>f, 'extraconfig', ' '.join(State.extraconfig)
+        if State.fromstep is not None:
+            print >>f, 'from', State.fromstep
+        if State.tostep is not None:
+            print >>f, 'to', State.tostep
+        if State.restart:
+            print >>f, 'restart True'
+        else:
+            print >>f, 'restart False'
+        if State.operation == '-cleandata':
+            print >>f, 'cleandata True'
+        else:
+            print >>f, 'cleandata False'
+        if State.operation == '-cleanall':
+            print >>f, 'cleanall True'
+        else:
+            print >>f, 'cleanall False'
+# end write_commandline_config()
+    
+def create_log_directory(curstep):
+    # Because the log path will almost always have .. in it
+    # so that the log directory is in the same directory as
+    # the step itself, we need a dummy step (called LOG) that
+    # gets thrown away.
+
+    destpath = get_logpath(os.path.join(curstep, 'LOG'))
+    if not os.path.exists(destpath):
+        try:
+            os.mkdir(destpath)
+        except OSError as err:
+            logging.error('Could not create log directory %s: %s',
+                          destpath, err.strerror)
+            sys.exit(1)
+# end create_log_directory()
+
+def create_config_directory(curstep):
+    destpath = get_configpath(os.path.join(curstep, 'CONFIG'))
+    if not os.path.exists(destpath):
+        try:
+            os.mkdir(destpath)
+        except OSError as err:
+            logging.error('Could not create config directory %s: %s',
+                          destpath, err.strerror)
+            sys.exit(1)
+# end create_config_directory()
+
+def start_logs(curstep):
+    logpath = get_logpath(curstep)
+    basestep = os.path.basename(curstep)
+
+    timespath = os.path.join(logpath, "TIMES." + basestep)
+
+    with open(timespath, 'w') as f:
+        print >>f, str(datetime.datetime.now())
+
+    progresspath = os.path.join(logpath, "IN-PROGRESS." + basestep)
+
+    with open(progresspath, 'w') as f:
+        f.write('\n')
+
+    # Remove leftover logs, if any.
+    donepath = os.path.join(logpath, "DONE." + basestep)
+    if os.path.exists(donepath):
+        os.unlink(donepath)
+
+    failedpath = os.path.join(logpath, "FAILED." + basestep)
+    if os.path.exists(failedpath):
+        os.unlink(failedpath)
+
+    stdoutpath = os.path.join(logpath, 'STDOUT.' + basestep)
+    if os.path.exists(stdoutpath):
+        os.unlink(stdoutpath)
+
+    stderrpath = os.path.join(logpath, 'STDERR.' + basestep)
+    if os.path.exists(stderrpath):
+        os.unlink(stderrpath)
+# end start_logs()
+
+def finish_logs(curstep, success):
+
+    # Too much of this is identical to start_logs. Need to
+    # consolidate.
+
+    logpath = get_logpath(curstep)
+    basestep = os.path.basename(curstep)
+
+    timespath = os.path.join(logpath, "TIMES." + basestep)
+
+    with open(timespath, 'a') as f:
+        print >>f, str(datetime.datetime.now())
+
+    progresspath = os.path.join(logpath, "IN-PROGRESS." + basestep)
+
+    # Don't die if it doesn't exist
+    try:
+        os.unlink(progresspath)
+    except OSError:
+        pass
+
+    if success:
+        with open(os.path.join(logpath, "DONE." + basestep), 'w') as f:
+            f.write('\n')
+    else:
+        with open(os.path.join(logpath, 'FAILED.' + basestep), 'w') as f:
+            f.write('\n')
+# end finish_logs()
+
+def done_exists(curstep):
+    '''Return True if matching DONE.step file exists OR if -restart was provided on the command line (in which case DONE processing should be ignored).'''
+    
+    if State.restart:
+        return False
+
+    logpath = get_logpath(curstep)
+    basestep = os.path.basename(curstep)
+    donepath = os.path.join(logpath, 'DONE.' + basestep)
+    return os.path.exists(donepath)
+# end done_exists()
+
+def copy_template(template, workdir):
+    '''
+    If workdir doesn't exist, or if it exists but is empty, copy from the template directory.
+    '''
+    
+    # Since copytree requires that the dest doesn't exist, delete
+    # the workdir if it exists but is empty.
+
+    if os.path.exists(workdir) and os.listdir(workdir) == []:
+        os.rmdir(workdir)
+
+    if not os.path.exists(workdir):
+        logging.info('%s is empty. Copying from template %s.', 
+                     workdir, template)
+        if not os.path.exists(template):
+            logging.error('Template directory %s not found.', template)
+            sys.exit(1)
+        try:
+            shutil.copytree(template, workdir, ignore=shutil.ignore_patterns('.*', '#*', '*~'))
+        except OSError as err:
+            logging.error('Could not copy from template %s to %s: %s', template, workdir, err.strerror)
+            sys.exit(2)
+# end copy_template()
+
+def cleandata(curstep):
+    '''
+    Clean the data directories under the given step, then recurse into any substeps, cleaning them too. Respects -from and -to arguments.
+
+    Note that this subroutine is called even for file steps so that -from/-to is handled correctly.
+    '''
+    path = os.path.abspath(os.path.join(State.topdir, curstep))
+
+    logging.debug('Traversing step %s', curstep)
+
+    # Update step_in_range based on -from argument
+    if not State.step_in_range and State.fromstep is not None and os.path.abspath(curstep) == os.path.abspath(State.fromstep):
+        State.step_in_range = True
+        logging.info('Beginning cleaning of data at -from %s', State.fromstep)
+
+    if os.path.isdir(path):
+        try:
+            os.chdir(path)
+        except OSError as err:
+            logging.error('Unable to change to directory %s: %s',
+                          path, err.strerror)
+            sys.exit(1)
+
+        # Clean stuff under this step
+        if State.step_in_range:
+            logging.info('Cleaning step %s', curstep)
+            datapath = get_datapath(os.path.join(curstep, 'data'))
+            for link in State.data_directory_path:
+                dirpath = os.path.join(datapath, link)
+                # It may not exist if the template was None
+                if not os.path.exists(dirpath):
+                    continue
+                if not os.path.islink(dirpath):
+                    logging.warning('%s is not a link. Not cleaning.', dirpath)
+                else:
+                    destpath = os.path.realpath(dirpath)
+                    # We might have already deleted if stepN is under stepN-i
+                    # so don't report an error if it doesn't exist.
+                    if os.path.exists(destpath):
+                        logging.info('Deleting %s (linked from %s).', destpath, dirpath)
+                        try:
+                            shutil.rmtree(destpath)
+                        except OSError as err:
+                            logging.warning('Could not remove %s for link %s: %s. Continuing.',
+                                          destpath, dirpath, err.strerror)
+    
+    # Update step_in_range based on -to argument.
+    if State.step_in_range and State.tostep is not None and os.path.abspath(curstep) == os.path.abspath(State.tostep):
+        State.step_in_range = False
+        logging.info('Ending cleaning of data at -to %s', State.tostep)
+        # Cannot exit here, since we might be cleaning all. But we can return
+        # so as not to recurse deeper.
+        return
+    
+    # Recurse into substeps
+    if os.path.isdir(path):
+        for fname in sorted([f for f in os.listdir(path) if f.startswith('step') and not f.endswith('~')]):
+            cleandata(os.path.join(curstep, fname))
+# end cleandata()
+
+def fill_template_string(instr, curstep):
+    return string.Template(instr).substitute(USER=os.environ['USER'],PROG=State.progname,HASH=State.hash,STEP=curstep,SYS=State.sysdir_name,TOP=State.topdir,HOST=socket.gethostname(),NOW=datetime.datetime.now().strftime('%c'))
+
+def setup_logging():
+    '''Setup python logging'''
+    numeric_level = getattr(logging, State.loglevel, None)
+    if not isinstance(numeric_level, int):
+        raise ValueError('Invalid log level: %s' % State.loglevel)
+    logging.basicConfig(level=numeric_level, format="%(module)s:%(levelname)s:%(asctime)s: %(message)s", datefmt='%Y-%m-%d-%H:%M:%S')
+# end setup_logging()
+
+
+class CallWithTimeout(object):
+    '''Call given cmd with the shell, redirecting stdout and stderr to specified files. If timeout is not None, it should be a floating point number. CallWithTimeout will kill the subprocess after this much time has passed and set self.timedout to True. If the process finishes, the return code will be in self.returncode. This is not intended for general purposes.'''
+
+    # The only method is __init__.
+
+    def __init__(self, cmd, stdoutfn, stderrfn, timeout=None):
+
+        # target() is called in a thread to actually run the shell job.
+        def target():
+            with open(stdoutfn, 'w') as stdoutf:
+                with open(stderrfn, 'w') as stderrf:
+                    self.proc = subprocess.Popen(cmd, shell=True,
+                                                 stdout=stdoutf, 
+                                                 stderr=stderrf)
+                    self.proc.wait()
+        
+        # Create a thread for the job and start it.
+        self.procthread = threading.Thread(target=target)
+        self.procthread.start()
+    
+        # Wait for the job to finish OR timeout.
+        self.procthread.join(timeout)
+
+        # If the thread is alive here, it means it timed out.
+        if self.procthread.is_alive():
+            # Terminate process. If terminate fails, kill.
+            try:
+                self.proc.terminate()
+            except:
+                self.proc.kill()
+            # Wait for the process and the thread.
+            self.proc.wait()
+            self.procthread.join()
+            # Set codes
+            self.timedout = True
+            self.returncode = -1
+            # NOTE BUG: For reasons I don't quite understand, the
+            # stdout and stderr log files don't seem to get closed
+            # immediately when timeouts occur. Sleep for a bit and
+            # hope it's enough.
+            time.sleep(5)
+        else:
+            # It didn't time out (but it still may have failed).
+            self.timedout = False
+            self.returncode = self.proc.returncode
+# end class CallWithTimeout
+
+def parse_arguments(strs):
+    '''Parse command line arguments and initialize things that need early initialization (such as logging).'''
+    parser = argparse.ArgumentParser(description='System for Running Systems v%s'%VERSION)
+
+    parser.add_argument('-config', dest='configfiles', action='append',
+                        help='Initial configuration file(s). Also used to configure srs-go itself.')
+    parser.add_argument('-template',
+                        help='Source template directory')
+    parser.add_argument('-dir', dest='topdir', required=True,
+                        help='Working directory')
+    parser.add_argument('-from', dest='fromstep',
+                        help='First step to execute')
+    parser.add_argument('-to', dest='tostep',
+                        help='Last step to execute')
+    parser.add_argument('-restart', action='store_true', help='Ignore normal DONE handling and rerun all steps (subject to -from/-to as normal)')
+    parser.add_argument('-loglevel', 
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        default='INFO',
+                        help='Logging level (default %(default)s)')
+    parser.add_argument('-cleandata', action='store_true', help='Remove everything under all data directories')
+    parser.add_argument('-cleanall', action='store_true', help='Remove everything, including under the data directories')
+    parser.add_argument('-timeout', type=float, help='If a file step takes longer than TIMEOUT seconds, it will be killed and considered failed.')
+    parser.add_argument('-retries', type=int, help='If a file step fails, it will be retried RETRIES times.')
+    parser.add_argument('-version', '--version', action='version', version="%s $Id: srs-go 629 2013-09-27 18:39:21Z janin $"%VERSION)
+    parser.add_argument('extraconfig', nargs='*', metavar='VAR VAL', help='Extra config variables/values set before all others.')
+
+    # Parse the arguments
+    args = parser.parse_args(strs)
+
+    # We want to set up logging immediately so we can, er, log.
+    # This is python logging, not srs logging
+    State.loglevel = args.loglevel
+    setup_logging()
+
+    State.topdir = os.path.abspath(args.topdir)    
+
+    if args.configfiles is None or args.configfiles == []:
+        args.configfiles = ['/dev/null'];
+
+    State.configfiles = [os.path.abspath(c) for c in args.configfiles]
+    State.extraconfig = args.extraconfig
+
+    State.fromstep = args.fromstep
+    State.tostep = args.tostep
+
+
+    if args.timeout is None:
+        if os.getenv('SRS_GO_TIMEOUT') is not None:
+            State.timeout = float(os.getenv('SRS_GO_TIMEOUT'))
+        else:
+            State.timeout = None
+    else:
+        State.timeout = args.timeout
+        os.environ['SRS_GO_TIMEOUT'] = str(State.timeout)
+
+    if args.retries is None:
+        State.retries = int(os.getenv('SRS_GO_RETRIES', 0))
+    else:
+        State.retries = args.retries
+        os.environ['SRS_GO_RETRIES'] = str(State.retries)
+
+    if args.restart:
+        State.restart = True
+    else:
+        State.restart = False
+
+    if State.fromstep is not None:
+        State.step_in_range = False
+    else:
+        State.step_in_range = True
+
+    if args.cleanall:
+        State.operation = '-cleanall'
+    elif args.cleandata:
+        State.operation = '-cleandata'
+    else:
+        State.operation = None
+
+    if args.template is not None:
+        State.template = os.path.abspath(args.template)
+
+# end parse_arguments()
+
+def set_template():
+    '''Set State.template based either on the command line -template argument, srs_go_template config variable, or a previous run of the same directory.'''
+
+    if State.template is None:
+        ctemplate = State.cf.get("srs_go_template")
+        if ctemplate is not None:
+            State.template = os.path.abspath(ctemplate)
+        else:
+            oldconfig = get_master_config_file()
+            if not os.path.exists(oldconfig):
+                logging.error('Unable to find template either on the command line (-template), from config files (srs_go_template), or from a previous run.\n')
+                sys.exit(1)
+            cf = srs.Config(oldconfig)
+            otemplate = cf.get('srs_go_template')
+            if otemplate is None:
+                logging.error('Unable to find srs_go_template from a previous run')
+                sys.exit(1)
+            State.template = os.path.abspath(otemplate)
+    State.cf.set('srs_go_template', State.template)
+# end set_template()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

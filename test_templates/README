@@ -1,0 +1,10 @@
+This directory holds various test of srs-go.
+
+To run the tests, just run ./testsuite.
+
+If you modify testsuite.at (the source code for the tests), you can
+regenerate testsuite by running:
+
+autom4te -l autotest testsuite.at -o testsuite
+
+This requires that GNU autotest (part of GNU automake) is installed.

@@ -1,0 +1,66 @@
+# $Id: srs_config_litestep 625 2013-09-24 21:46:06Z janin $
+#
+# Copyright 2012, 2013 International Computer Science Institute
+# See the file LICENSE for licensing terms.
+#
+# This is not an executable script, but a tricky function to be
+# sourced by shell scripts that implement the srs-go-parallel-litestep
+# framework -- for which it is necessary to load a config from stdin.
+#
+# The srs-config tool is unsuitable, since it does not maintain state
+# between calls and would try to load the config file each time it is
+# called -- that can only be done one time with stdin.
+#
+# An alternative would be to first write stdin to a temporary file,
+# and read that multiple times with srs-config.  You should be careful
+# to clean up afterwards.  But we don't really want to screw around
+# with the trap signal handling that may already be present and
+# necessary in the shell script that calls this.
+#
+# To use this:
+#
+# 1. Set the SRS_CONFIG environment variable, e.g.:
+#
+# export SRS_CONFIG=/dev/stdin
+#
+# 2. Then source this file.  Despite not being executable, it should
+# be in your $PATH.  Sourcing it will declare a variable to hold the
+# dumped contents of the SRS config.  It will also declare a function
+# with the same name as this file (which scopes before $PATH).  E.g.:
+#
+# source srs_config_litestep
+#
+# 3. Now you may call this function to query the config for a key,
+# provided as the first argument; other arguments, if specified, form
+# the default value to be returned if the key is not found. E.g.:
+#
+# varA=`srs_config_litestep keyA`
+# varB=`srs_config_litestep keyB this is the default value string`
+#
+
+# Store the config in a global variable
+SRS_CONFIG_DUMP=`srs-config -dump`
+
+function srs_config_litestep() {
+    # Parse one or more arguments
+    if [ $# -lt 1 ] ; then
+        echo "ERROR: srs_config_litestep: must specify a key argument" >&2
+        return 1
+    fi
+    local key=$1
+    shift
+    local default=$@
+    
+    # Check if the key is defined; this cannot be 'grep -q'
+    if echo "$SRS_CONFIG_DUMP" | grep "^$key\b" > /dev/null ; then
+        local value=`set -o pipefail; echo "$SRS_CONFIG_DUMP" | grep "^$key\b" | sed 's,\s\+,\t,' | cut -f 2-`
+        echo "$value"
+        return 0
+    elif [ -n "$default" ]; then
+        echo "$default"
+        return 0
+    else
+        echo "ERROR: srs_config_litestep: Could not find $key" >&2
+        return 1
+    fi
+}

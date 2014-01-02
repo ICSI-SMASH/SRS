@@ -1,0 +1,87 @@
+Initial version: Feb 21, 2012 Adam Janin
+
+Version 0.2, April 12, 2012 Adam Janin
+ Modified so that the default config file is /dev/null
+and previous values of -config and extraconfig are ignored.
+The only time a previous value is used is -template can
+be omitted, and it will be recovered from a previous run.
+ MASTER.config is now a dump of all the variables from -config
+and extraconfig rather than extraconfig followed by INCLUDE.
+I think this is better for achiving the actual experiment.
+If you want to repeat a previous run with the same config,
+you can do e.g. -config exp01/SRS-GO/config/MASTER.config
+
+Version 0.3, Jan 14, 2013 Adam Janin
+ Files in the template starting with . or # or ending with ~
+are not copied.
+ Time stamps in log output.
+ Multiple -config arguments are now supported.
+ Various srs-go config variables are now read from the -config
+files and from the command line.
+ Redesign of how data directories and their templates work. Now, the
+config variable srs_go_data_directories should be a space separated
+list of names of directories that will get created (as links) under
+srs_go_datapath_template (e.g. SRS-GO/data). For each entry X, there
+must be an entry srs_go_data_template_X that defines where the
+physical directory will be created.
+ Added -timeout <float>. If a file step takes more than <float>
+seconds to complete, it will be killed and is considered failed.
+ Added -retries <N>. If a file step fails, it will be tried <N> times.
+
+Version 0.31, Feb 17, 2013 Adam Janin
+ Changed -retries/-timeout logic to use environment variables
+so that indirect calls to srs-go will abide by -retries/-timeout
+unless they are explicitly specified on the command line by
+the indirect call to srs-go.
+ Fixed minor bug with log file naming where .tryN was created
+even if with -retries 0.
+ Subprocess calls to the steps are a bit more bullet-proof.
+ If steps contain non-ascii, print an error and die.
+ The default output config file is now always written.
+
+Version 0.32, Feb 28, 2013 Adam Janin
+ Fixed logic of seen_not_done to allow directory steps to
+continue in the middle (rather than an entire directory
+step being restarted).
+
+Version 0.4, ???, Adam Janin
+
+Fixed -from logic so that config files are linked.
+
+Fixed a bug in the -from/-to/-restart interaction.
+
+Data directories in the config file are now specified by a prefix
+rather than with a full template. $USER/$PROG/$HASH/$STEP is appended
+to generate the full path.
+
+Removed the ability to override logpath_template,
+datapath_template, and configpath_template because it would cause
+huge confusion if anybody actually ever did that.
+
+Config files are now loaded in the following order:
+ 1) Command line "extra config" arguments
+ 2) Config files specified by -config command line
+ 3) Files from the colon separated list in the environment variable
+$SRS_GO_CONFIG (e.g. setenv SRS_GO_CONFIG /u/janin/rats.srs-go.config)
+ 4) SCRIPTDIR/srs-go.config, where SCRIPTDIR is the directory where
+the script srs-go lives.
+
+All variables from all of the above config files are now included in
+MASTER.config.
+
+Rearranged logic of when config variables are loaded.
+
+The template can now be specified either using the -template argument
+or the config variable srs_go_template. The command line -template
+argument overrides the config variable.
+
+For reasons I don't quite understand, the stdout and stderr log files
+don't seem to get closed immediately when timeouts occur, which can cause
+oddness under NFS. The code now will sleep for 5 seconds if a timeout
+occurs in the hope that NFS will catch up.
+
+Changed ad-hoc tests to use GNU Autotest.
+
+-dir is now a required argument rather than defaulting to the current
+directory.
+

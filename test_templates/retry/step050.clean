@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+{
+set -o nounset
+set -o errexit
+set -o pipefail
+
+inconfig=$1
+outconfig=$2
+
+cf=`srs-config -c $inconfig -c default.config count_file`
+rm -f $cf
+
+exit
+}

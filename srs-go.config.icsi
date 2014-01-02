@@ -1,0 +1,30 @@
+######################################################################
+#
+# This config file is read by srs-go and should hold variables
+# that control where srs-go creates data directories. It currently
+# represents the setup at ICSI.
+#
+
+######################################################################
+#
+# The following section controls how the data directories are
+# created.
+#
+
+# List of links created under the data directory
+srs_go_data_directories scratch_local_ttmp scratch_ttmp scratch
+
+# For each entry X in srs_go_data_directories, there must be an entry
+# srs_go_data_path_X in this section, which controls where the
+# physical directories are created. They must point to separate
+# directories. Directories will be created automatically under
+# these directories by appending $USER/srs-go/$HASH, where
+# $USER is the user log in name and $HASH is a pseudo random
+# string.
+#
+# You can use $$USER in the strings below and it will be replaced
+# by the user's log in name.
+
+srs_go_data_path_scratch_local_ttmp /tscratch/tmp
+srs_go_data_path_scratch_ttmp /u/drspeech/ttmp
+srs_go_data_path_scratch /u/drspeech/data/swordfish/users

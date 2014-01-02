@@ -1,0 +1,15 @@
+This template is for testing srs-go.
+
+Each step is a symbolic link to testcmd.sh, which just echos the 
+name of the command.
+
+If you set the config variable failsteps, a step will fail if
+the name of the command occurs anywhere in failsteps.
+
+For example, if there's a command called step010.step030 and failsteps
+is set to "step010.step020,step010.step030" then step010.step030 will
+print an error message and fail.
+
+All the steps are named for the REVERSE path they follow from the
+root. For example, step010.step030.step020 is under the top level as
+./step020/step030.step020/step010.step030.step020

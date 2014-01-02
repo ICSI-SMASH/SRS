@@ -1,0 +1,131 @@
+#!/bin/sh
+# wrapper used to run remote jobs
+#
+# This version call rexport.make and ignores
+# most flags. It is intented for use on a single
+# machine (e.g. on a virtual machine).
+#
+
+# rexport=${RUN_COMMAND_REXPORT-rexport.make}
+rexport=${RUN_COMMAND_REXPORT-rexport}
+
+######
+## if system does not have pmake but has gnumake
+if ! pmake_var="$(type -p "pmake")" || [ -z "$pmake_var" ]; then
+	if gnumake_var="$(type -p "gnumake")" && [ -n "$gnumake_var" ] ; then
+		rexport=${RUN_COMMAND_REXPORT-rexport.gnumake}
+	elif make_var="$(type -p "make")" && [ -n "$make_var" ] ; then
+		rexport=${RUN_COMMAND_REXPORT-rexport.gnumake}
+	else 
+		echo "The system must have either pmake or gnumake" >>$logfile 2>&1
+		exit $status
+	fi
+fi
+
+njobs=12
+delay=0
+
+if [ -w /dev/fd/1 ]; then
+	logfile=/dev/fd/1
+elif [ -w /dev/stdout ]; then
+	logfile=/dev/stdout
+else
+	logfile=run-command.log
+fi
+
+pass_options=
+notify_user=
+
+while [ $# -gt 1 ]
+do
+	case "$1" in
+	-log)	logfile=$2;
+		shift; shift;;
+	-attr)	attr="$attr $2";
+		shift; shift;;
+	-check-exec)
+		if [ -z "$no_check_exec" ]; then
+		    pass_options="$pass_options $1";
+		fi
+		shift ;;
+	-exit-on-error)
+		pass_options="$pass_options $1";
+		shift ;;
+	-notify)
+		notify_user=`whoami`;
+		shift ;;
+	-notsame)	
+		arch=
+		kickme=
+		shift;;
+	-f)	script=$2;
+		shift; shift;;
+	-J)	njobs=$2;
+		shift; shift;;
+	-*)	echo "unknown $1 option "
+		exit 1;;
+	*)	break;;
+	esac
+done
+
+# Truncate the log file at 0 now and only append from here on
+# (avoid doing this for stdout, in case it is redirected to file)
+#
+case $logfile in
+/dev/*) ;;
+*)	>$logfile ;;
+esac
+
+#
+# guard against recursive exporting of commands
+#
+if [ -n "$RUN_COMMAND" ]; then
+	echo "$0: recursive invocation from $RUN_COMMAND; running commands locally!" >&2
+
+	# don't attempt to redirect to /dev/stdout,
+	# (fails on linux if already redirected in the environment)
+	case "$logfile" in
+	/dev/stdout|/dev/fd/1) ;;
+	*)	exec >> $logfile 2>&1 ;;
+	esac
+
+	if [ -n "$script" ]; then
+		exec sh "$script"
+	else
+		exec sh -c "$*"
+	fi
+fi
+
+RUN_COMMAND="$$@`hostname`"
+export RUN_COMMAND
+
+#
+# run either a script or a single command
+#
+if [ -n "$script" ]; then
+	command="$script"
+	echo "Running $rexport -f $script" >> $logfile
+	$rexport -attr "$attr" -J $njobs -delay $delay $pass_options -f "$script" >>$logfile 2>&1
+	status=$?
+else
+	command="$1"
+	shift
+	echo "Running $command $@" >> $logfile
+	$rexport -attr "$attr" -J $njobs $pass_options "$command" "$@" \
+								>>$logfile 2>&1
+	status=$?
+fi
+
+if [ $status -ne 0 ]; then
+	echo "*** $command failed with status $status;" >&2
+	echo "*** examine output in $logfile." >&2
+fi
+
+if [ -n "$notify_user" ]; then
+	Mail -s "Process completion notification" $notify_user <<.
+$command completed with status $status
+in directory `pwd` 
+on `date`.
+.
+fi
+exit $status

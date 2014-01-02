@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# Sleep for a bit, then succeed.
+
+{
+set -o nounset
+set -o errexit
+set -o pipefail
+
+inconfig=$1
+outconfig=$2
+
+sleep=`srs-config -c $inconfig -c default.config sleep`
+echo Sleeping for $sleep seconds
+sleep $sleep
+echo Done sleeping.
+exit
+}
+

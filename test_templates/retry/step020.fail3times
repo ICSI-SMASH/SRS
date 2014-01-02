@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# Fail 3 times, then succeed.
+
+{
+set -o nounset
+set -o errexit
+set -o pipefail
+
+inconfig=$1
+outconfig=$2
+
+cf=`srs-config -c $inconfig -c default.config count_file`
+
+count=$[ `head -n1 $cf` - 1 ]
+
+echo $count > $cf
+
+if [ $count -gt 0 ]; then
+    echo $0 failing at count=$count 1>&2
+    false
+else
+    echo $0 succeeding at count=$count 1>&2
+    true
+fi
+
+exit
+}

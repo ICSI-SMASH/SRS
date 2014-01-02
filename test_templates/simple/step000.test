@@ -1,0 +1,6 @@
+#!/bin/sh
+echo step000
+echo v1
+srs-config -config $1 v1
+echo v2
+srs-config -config $1 v2

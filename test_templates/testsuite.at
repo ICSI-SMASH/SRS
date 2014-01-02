@@ -1,0 +1,199 @@
+m4_define([AT_PACKAGE_STRING],    [srs-go v0.4])
+m4_define([AT_PACKAGE_BUGREPORT], [janin@icsi.berkeley.edu])
+
+AT_INIT([Templates tests])
+
+######################################################################
+#
+# Most of the test work the same way. srs-go is called. It's output
+# is captured to test.log, but otherwise ignored (this is just to
+# help with debugging). The template also writes an output file,
+# which is checked against expected ground truth. Then we erase
+# the template. Note that if tests fail, you should manually
+# call srs-go -cleanall to avoid orphan experiments.
+#
+
+
+######################################################################
+######################################################################
+# 
+# Test nested templates.
+#
+
+AT_BANNER([Nested template test])
+
+######################################################################
+#
+# Run template "nest" to completion. Output to test.out. srs-go
+# log file in test.log.
+#
+
+AT_SETUP([Simple run to completion])
+AT_CHECK([srs-go -template $at_dir/nest -dir exp.test -- outfile `pwd`/test.out > test.log 2>&1], [], [])
+AT_CHECK([cat test.out], [], [step010
+step010.step010.step020
+step020.step010.step020
+step020.step020
+step010.step030.step020
+])
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR], [], [])
+AT_CLEANUP
+
+######################################################################
+#
+# Fail at a particular step.
+#
+
+AT_SETUP([Fail in a nested step])
+AT_CHECK([srs-go -template $at_dir/nest -dir exp.test -- outfile `pwd`/test.out failsteps step020.step010.step020 > test.log 2>&1], [1], [])
+AT_CHECK([cat test.out], [], [step010
+step010.step010.step020
+step020.step010.step020
+step020.step010.step020 failed
+])
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR], [], [])
+AT_CLEANUP
+
+######################################################################
+#
+# Start from scratch in the middle of a template
+#
+
+AT_SETUP([Start in the middle])
+AT_CHECK([srs-go -template $at_dir/nest -dir exp.test -from step020/step010.step020/step020.step010.step020 -- outfile `pwd`/test.out > test.log 2>&1], [], [])
+AT_CHECK([cat test.out], [], [step020.step010.step020
+step020.step020
+step010.step030.step020
+])
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR], [], [])
+AT_CLEANUP
+
+######################################################################
+#
+# Test rerunning from failed steps
+#
+
+AT_SETUP([Test rerunning templates])
+
+# Fail early
+AT_CHECK([srs-go -template $at_dir/nest -dir exp.test -- failsteps 'step010' outfile `pwd`/testa.out > testa.log 2>&1], [1], [])
+AT_CHECK([cat testa.out], [], [step010
+step010 failed
+])
+
+# Restart a bit later
+AT_CHECK([srs-go -dir exp.test -- failsteps 'step010.step010.step020' outfile `pwd`/testb.out > testb.log 2>&1], [1], [])
+AT_CHECK([cat testb.out], [], [step010
+step010.step010.step020
+step010.step010.step020 failed
+])
+
+# .. and so on
+AT_CHECK([srs-go -dir exp.test -- failsteps 'step020.step010.step020' outfile `pwd`/testc.out > testc.log 2>&1], [1], [])
+AT_CHECK([cat testc.out], [], [step010.step010.step020
+step020.step010.step020
+step020.step010.step020 failed
+])
+
+AT_CHECK([srs-go -dir exp.test -- failsteps 'step020.step020' outfile `pwd`/testd.out > testd.log 2>&1], [1], [])
+AT_CHECK([cat testd.out], [], [step020.step010.step020
+step020.step020
+step020.step020 failed
+])
+
+AT_CHECK([srs-go -dir exp.test -- failsteps 'step010.step030.step020' outfile `pwd`/teste.out > teste.log 2>&1], [1], [])
+AT_CHECK([cat teste.out], [], [step020.step020
+step010.step030.step020
+step010.step030.step020 failed
+])
+
+AT_CHECK([srs-go -dir exp.test -- outfile `pwd`/testf.out > testf.log 2>&1], [], [])
+AT_CHECK([cat testf.out], [], [step010.step030.step020
+])
+
+# Clean up
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR], [], [])
+
+AT_CLEANUP
+
+######################################################################
+#
+# Test restarting using the -restart flag
+#
+
+AT_SETUP([-restart tests])
+AT_CHECK([srs-go -template $at_dir/nest -dir exp.test -- outfile `pwd`/testa.out failsteps step020.step010.step020 > testa.log 2>&1], [1], [])
+AT_CHECK([cat testa.out], [], [step010
+step010.step010.step020
+step020.step010.step020
+step020.step010.step020 failed
+])
+
+AT_CHECK([srs-go -dir exp.test -restart -- outfile `pwd`/testb.out failsteps step020.step020 > testb.log 2>&1], [1], [])
+AT_CHECK([cat testb.out], [], [step010
+step010.step010.step020
+step020.step010.step020
+step020.step020
+step020.step020 failed
+])
+
+AT_CHECK([srs-go -dir exp.test -restart -from step020/step010.step020/step020.step010.step020 -- outfile `pwd`/testc.out > testc.log 2>&1], [], [])
+AT_CHECK([cat testc.out], [], [step020.step010.step020
+step020.step020
+step010.step030.step020
+])
+
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR], [], [])
+
+AT_CLEANUP
+
+######################################################################
+#
+# Test stopping in the middle with -to.
+#
+
+AT_SETUP([-to tests])
+AT_CHECK([srs-go -template $at_dir/nest -dir exp.test -to step020/step010.step020/step010.step010.step020 -- outfile `pwd`/testa.out > testa.log 2>&1 ], [], [])
+AT_CHECK([cat testa.out], [], [step010
+step010.step010.step020
+])
+
+AT_CHECK([srs-go -dir exp.test -- outfile `pwd`/testb.out > testb.log 2>&1], [], [])
+AT_CHECK([cat testb.out], [], [step020.step010.step020
+step020.step020
+step010.step030.step020
+])
+
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR])
+
+AT_CLEANUP
+
+######################################################################
+######################################################################
+# 
+# Retry and timeout tests. Currently, just tests that they fail or
+# succeed correctly. They should probably be expanded to actually make
+# sure they run the correct number of times.
+#
+
+AT_BANNER([Retry and timeout tests])
+
+AT_SETUP([Timeout and fail])
+AT_CHECK([srs-go -template $at_dir/timeout -dir exp.test -timeout 2 > test.log 2>& 1], [1], [])
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR])
+AT_CLEANUP
+
+AT_SETUP([Retry then fail])
+AT_CHECK([srs-go -template $at_dir/retry -dir exp.test -retries 2 > test.log 2>&1], [1], [])
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR])
+AT_CLEANUP
+
+AT_SETUP([Retry successfully with timeouts])
+AT_CHECK([srs-go -template $at_dir/retry -dir exp.test -retries 3 -timeout 5 > test.log 2>&1], [], [])
+AT_CHECK([srs-go -cleanall -dir exp.test -loglevel ERROR], [], [])
+AT_CLEANUP
+
+######################################################################
+#
+# 
+#

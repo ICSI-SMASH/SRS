@@ -1,0 +1,96 @@
+As a beta release, SRS install is still highly manual. We welcome
+suggestions for how to make this easier.
+
+QUICK START
+----------------------------------------------------------------------
+
+The SRS tools can be run in place. Simply add this directory to
+your path and to your PYTHONPATH, and copy srs-go.config.user to
+srs-go.config. Then take a look at the tutorial under doc/tutorials.
+
+See below for the complete install procedure.
+
+
+DATA STORAGE
+----------------------------------------------------------------------
+
+The primary configuration options relate to disk storage. SRS
+templates assume that various classes of disk space will be available
+to them using links under their SRS-GO/data directory. For the
+Swordfish project, these include the following:
+
+scratch - Networked disk that is not backed up.
+
+scratch_ttmp - Network disk that is not backed up and where files are
+deleted automatically if they're not accessed in 30 days.
+
+scratch_local_ttmp - Local disk that is not backed up and where files
+are deleted automatically if they're not accessed in 30 days.
+
+You must specify in the config file (see below) where these links
+will physically point. For example, at ICSI, local disks that
+are automatically purged are mounted in the file system under
+/tscratch/tmp. If your site instead just uses a large /tmp for the
+same purpose, you would change srs-go.config to have the line:
+
+srs_go_data_template_scratch_local_ttmp /tmp
+
+If your site doesn't have a class of disk (e.g. no automatically
+deleted files), it is fine to "upgrade" ttmp to non-ttmp and local to
+networked, but they must all be in unique directories.
+
+
+CONFIG FILE
+----------------------------------------------------------------------
+
+The SRS program srs-go requires a config file, which must be in the
+same directory as the srs-go executable. There's a sample config
+file called srs-go.config.icsi that can be used as a basis for your
+site's config file. You should copy srs-go.config.icsi, update it with
+your site's config (see above), and move the new config file to the
+appropriate directory. For sites without complex disk subsystems,
+you can base your config file on srs-go.config.user instead.
+
+
+PARALLEL EXECUTION
+----------------------------------------------------------------------
+
+The program srs-go-parallel calls another program called "run-command"
+to launch jobs on a cluster. At ICSI, run-command uses either customs
+or slurm to actually distribute the jobs. We currently do not yet
+provide run-command nor have we yet written a document describing how
+to modify it to support other queuing systems. Please contact Adam
+Janin <janin@icsi.berkeley.edu> if you need to use srs-go-parallel.
+
+
+MAKEFILE
+----------------------------------------------------------------------
+
+The Makefile is used to install SRS at ICSI. It will require
+modification to use it elsewhere.
+
+First, you must set the environment variable SWORDFISH_ROOT to
+a directory structure where the tools and support files will be
+installed. You should create a directory and set SWORDFISH_ROOT to its
+absolute path.
+
+SRS scripts will be installed under $SWORDFISH_ROOT/share/bin, which
+should be added to your shell path. Python libraries are installed
+under $SWORDFISH_ROOT/share/lib/python, which should be added to your
+python path (e.g. $PYTHONPATH). Perl libraries are installed under
+$SWORDFISH_ROOT/share/lib/perl, which should be added to your perl
+path (e.g. $PERL5LIB).
+
+There is a bug at ICSI related to files being copied non-atomically
+over NFS. To correct this, we use an in-house tool call nfs_sync_cp.
+If you're not at ICSI, you should edit the top of the Makefile to
+comment out the line setting USE_NFS_SYNC_CP. I.e.:
+
+#USE_NFS_SYNC_CP=1
+
+
+INSTALLING SRS
+----------------------------------------------------------------------
+
+Once the above steps have been followed, call "make install" to copy
+all relevant files to directories under $SWORDFISH_ROOT.

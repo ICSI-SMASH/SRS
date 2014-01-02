@@ -1,0 +1,9 @@
+This directory contains the System for Running Systems (SRS), a set of
+tools built under the Swordfish project at ICSI to support the IARPA
+Babel program.
+
+Note that this is an early BETA release of SRS. There are known bugs,
+missing features, and the install process is somewhat involved.
+
+Contact Adam Janin <janin@icsi.berkeley.edu> if you have questions
+or comments.

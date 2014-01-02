@@ -1,0 +1,473 @@
+#!/usr/bin/env python
+# $Id: srs-go-parallel 625 2013-09-24 21:46:06Z janin $
+#
+# File: srs-go-parallel
+# Copyright 2012, 2013 International Computer Science Institute
+# See the file LICENSE for licensing terms.
+#
+# System for Running Systems parallel execution engine.
+#
+# Currently only supports run-command style clusters. The dependance
+# on run-command is pretty deep. Large parts would probably have to be
+# rewritten to support other queuing systems.
+#
+# Versions
+#
+# Initial Version: Mar 27, 2012 Adam Janin
+#
+# Version 0.2 April 13, 2012 Adam Janin (lots of ideas from Arlo)
+#  Argument to -config is evaluated relative to current directory
+# rather than task directory. It is also optional.
+#  It is now an error if -dir is not empty unless -clean* is used.
+#  Directory structure under -dir reorganized.
+#  Failed tasks are listed as symbolic links under failed_tasks
+# to the tasks/task000i directory.
+#  Added -preserve option which may be:
+#   none     Delete all task directories when they exit.
+#   errors   Delete task directories if task returns exit code 0
+#   all      Do not delete task directories
+# This does NOT effect the links under failed_tasks directly,
+# though it does mean they might link to non-existent directories.
+#
+# May 18, 2012 Adam Janin
+# No new version number. Added -attr which just gets added to
+# the run-command arguments.
+#
+# Feb 27, 2012 Adam Janin
+# No new version number. Remove -attr scratch_tmp requirement.
+#
+# TODO
+#
+# When running -cleandata, batch up all the tasks per machine
+# and execute in one call. Probably use pdsh
+#
+# Rethink what to do if dest directory is not empty.
+#
+# Unify subdirectory code and make it more general (e.g. read
+# template from config file).
+#
+# Check that I use "task" and "batch" consistently
+#
+
+VERSION = 0.2
+
+import sys
+import logging
+import argparse
+import os
+import os.path
+import math
+import stat
+import subprocess
+import re
+import shutil
+
+import srs
+import srs_go_parallel_launch
+
+class PVar:
+    def __init__(self, vn, fn):
+        # Name of the variable
+        self.varname = vn
+
+        # File name to read from
+        self.filename = fn
+
+        # File object returned by open(self.filename)
+        self.file = None
+
+class State:
+    '''Stores state information for this program. There should be no instances of State.'''
+
+    # Command line arguments.
+    # All of these should always be assigned in parse_arguments()
+
+    # These are used by srs-go-parallel
+    topdir = None
+    loglevel = None
+    batchsize = None
+    pvar = None  # List of type PVar
+    extra_attrs = None   # List of strings of additional -attr for run-command
+
+    # What operation to perform. One of -cleandata, -cleanall, or None
+    # (for normal operation). Set in parse_arguments based on flags.
+    operation = None
+
+    # If we should stop immediately upon error.
+    exit_on_error = False
+
+    # Which task subdirectories should be preserved.
+    # See help.
+    preserve = 'errors'
+
+    # Name of the program. Used to substitute into $PROG in
+    # data_directory_template. Must be set in main()
+    progname = None
+
+    # The following are simply passed to srs-go
+
+    configfile = None
+    template = None
+    fromstep = None
+    tostep = None
+    extraconfig = None
+
+    # if srs runs on single machine or cluster
+    singleMachine = False
+
+######################################################################
+
+def main(argv):
+    State.progname = os.path.basename(argv[0])
+    parse_arguments(argv[1:])
+
+    # We don't want all the subcommands to fail after
+    # we route them all to different machines, so do
+    # lots of error checking here.
+    validate_commandline()
+
+    if State.operation == '-cleandata' or State.operation == '-cleanall':
+        do_clean()
+        return 0
+    
+    # Create the top directory if it doesn't exist
+    if not os.path.exists(State.topdir):
+        try:
+            os.mkdir(State.topdir)
+        except OSError as err:
+            logging.error('Could not create directory %s.', State.topdir)
+            sys.exit(1)
+
+    if not os.path.isdir(State.topdir):
+        logging.error('%s is not a directory', State.topdir)
+        sys.exit(1)
+
+    if os.listdir(State.topdir):
+        logging.error('%s must be empty.', State.topdir)
+        sys.exit(1)
+
+    ntasks = nlines_in_file(State.pvar[0].filename)
+    nbatches = int(math.ceil(ntasks / float(State.batchsize)))
+
+    # NOTE: This implementation opens all the parallel variable files
+    # simultaneously. This should not be a problem on modern linuxes.
+
+    parfiles = []
+    for p in State.pvar:
+        try:
+            p.file = open(p.filename)
+        except IOError as err:
+            logging.error('Unable to open parallel variable file %s for variable %s: %s', p.filename, p.varname, err.strerror)
+            sys.exit(1)
+
+    # Create subdirs if needed
+    make_subdir(os.path.join(State.topdir, 'batches'))
+    make_subdir(os.path.join(State.topdir, 'tasks'))
+    make_subdir(os.path.join(State.topdir, 'failed_tasks'))
+    make_subdir(os.path.join(State.topdir, 'failed_pvars'))
+
+    # Assemble the command line for the task
+    cl = ['srs-go']
+    cl.append('-template %s'%(State.template))
+    cl.append('-loglevel %s'%(State.loglevel))
+    if State.fromstep is not None:
+        cl.append('-from %s'%(State.fromstep))
+    if State.tostep is not None:
+        cl.append('-to %s'%(State.tostep))
+
+    task_commandline_prefix = ' '.join(cl)
+
+    run_batchesf = open(os.path.join(State.topdir, 'run_batches.cmds'), 'w')
+        
+    taski = 0
+    for batchi in range(0, nbatches):
+        batchpath = os.path.join(State.topdir, 'batches', 'batch%07d.sh'%(batchi))
+        print >>run_batchesf, batchpath
+        batchf = open(batchpath, 'w')
+        print >>batchf, '#!/bin/bash\n#\n# Automatically generated from command:\n#\n# %s\n#\n# Batch %d\n'%(' '.join(sys.argv), batchi)
+
+        for batchline in range(0, State.batchsize):
+            taskname = 'task%07d'%(taski)
+            taskdir = os.path.join(State.topdir, 'tasks', taskname)
+            print >>batchf, ''
+            cmdpre = [task_commandline_prefix]
+            cmdpre.append('-dir %s'%(taskdir))
+            cmdpre.append('-config %s'%(State.configfile))
+            cmdpost = ['--']
+            for ii in range(0, len(State.extraconfig), 2):
+                cmdpost.append(State.extraconfig[ii]);
+                cmdpost.append("'" + State.extraconfig[ii+1] + "'")
+            for p in State.pvar:
+                val = p.file.readline()
+                if val[-1] == '\n':
+                    val = val[0:-1]
+                    cmdpost.append(p.varname)
+                    cmdpost.append("'" + val + "'")
+            batchf.write(' '.join(cmdpre))
+            batchf.write(' ')
+            batchf.write(' '.join(cmdpost))
+
+            # Add code to check for exit status and update failed_tasks
+
+            cmdpre.append('-cleanall')
+            cleancmd = ' '.join(cmdpre) + ' ' + ' '.join(cmdpost)
+
+            print >>batchf, '\n'
+            print >>batchf, 'if [ "$?" -ne 0 ]; then'
+            print >>batchf, '  ln -s ../tasks/%s %s'%(taskname, os.path.join(State.topdir, 'failed_tasks', taskname))
+            if State.exit_on_error:
+                print >>batchf,  '  exit 1'
+            # Set up cleaning if needed.
+            if State.preserve == 'none':
+                print >>batchf, 'fi\n'
+                print >>batchf, cleancmd
+            elif State.preserve == 'errors':
+                print >>batchf, 'else'
+                print >>batchf, ' ', cleancmd
+                print >>batchf, 'fi'
+            elif State.preserve == 'all':
+                print >>batchf, 'fi'
+            print >>batchf, ''
+            taski += 1
+            if taski >= ntasks:
+                break
+        batchf.close()
+
+        # Make it executable
+        os.chmod(batchpath, os.stat(batchpath).st_mode | stat.S_IXUSR)
+
+    run_batchesf.close()
+
+    # Close the parallel variable files
+    for p in State.pvar:
+        try:
+            p.file.close()
+        except IOError as err:
+            logging.error('Unable to close parallel variable file %s for variable %s: %s', p.filename, p.varname, err.strerror)
+            sys.exit(1)
+
+    # Assemble command line
+    
+    retcode = srs_go_parallel_launch.doRunCommand(State)
+    '''
+    runcmd = ['run-command']
+
+    if State.exit_on_error:
+        runcmd.append('-exit-on-error')
+
+    # Run on 64 bit machines only
+    runcmd.append('-attr x86_64')
+
+    # Machines with local ttmp disk
+    runcmd.append('-attr tscratch_tmp')
+
+    # Add extra attrs if any
+    for attr in State.extra_attrs:
+        runcmd.append('-attr %s'%(attr))
+    
+    # Log file
+    runcmd_logfile = open("%s/run-command.log" %  State.topdir, 'w')
+
+    # Number of jobs
+    runcmd.append('-J %d'%(State.njobs))
+
+    # The script file to run
+    runcmd.append('-f %s'%(os.path.join(State.topdir, 'run_batches.cmds')))
+
+    runcmdstr = ' '.join(runcmd)
+            
+    # Create a pipe object to capture stdout and stderr
+    runcmd_proc = subprocess.Popen(runcmdstr, shell=True, 
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    # Monitor run-command's output and look for pattern's matching srs-go's logging
+    # Also write both stderr and stdout to run-command.log
+    for line in runcmd_proc.stdout:
+        runcmd_logfile.write(line)
+        line = line.strip()
+        match = re.match(r'srs-go:(CRITICAL|ERROR|WARNING|INFO):', line)
+        if match:
+            level = match.group(1)
+            if level == 'CRITICAL' or level == 'ERROR':
+                if State.exit_on_error:
+                    logging.error('run-command.log: ' + line)
+                else:   
+                    # if not exiting, downgrade to a mere warning
+                    logging.warning('run-command.log: ' + line)
+            elif level == 'WARNING':
+                logging.warning('run-command.log: ' + line)
+            elif level == 'INFO':
+                logging.info('run-command.log: ' + line)
+        else:
+            logging.debug('run-command.log: ' + line)
+    runcmd_logfile.close()
+
+    retcode = runcmd_proc.wait()
+
+    write_failed_pvars()
+    '''
+
+    return retcode
+
+# def write_failed_pvars():
+#     '''For each failed task (as determined by entries in failed_tasks), write an entry to a file in failed_pvars for each pvar'''
+#     # Open files for writing.
+#     for p in State.pvar:
+#         try:
+#             p.file = open(os.path.join(State.topdir, 'failed_pvars', p.varname), 'w')
+#         except IOError as err:
+#             logging.error('Unable to write parallel variable file for variable %s: %s', p.varname, err.strerror)
+#             sys.exit(1)
+
+#     for failedpath in os.listdir(os.path.join(State.topdir, 'failed_tasks')):
+#         if re.match('task[0-9]+', failedpath):
+#             c = srs.Config(os.path.join(State.topdir, 'failed_tasks', failedpath, 'SRS-GO', 'config', 'MASTER.config'))
+#             for p in State.pvar:
+#                 print >>p.file, c.get(p.varname)
+
+#     for p in State.pvar:
+#         p.file.close()
+
+def validate_commandline():
+    '''Make sure all the command line arguments make sense.'''
+
+    if State.operation is None and not os.path.exists(State.template):
+        logging.error('Template directory %s does not exist', State.template)
+        sys.exit(1)
+
+    # Each pvar file should exist and have exactly the same length.
+    # Loop with index so we can extract the first one to compare to
+    # all the others without special casing it.
+
+    for ii in range(0, len(State.pvar)):
+        p = State.pvar[ii]
+        if not os.path.exists(p.filename):
+            logging.error('Parallel variable file %s for variable %s does not exist.', p.filename, p.varname)
+            sys.exit(1)
+        nlines1 = nlines_in_file(p.filename)
+        if ii == 0:
+            nlines0 = nlines1
+        if nlines1 != nlines0:
+            logging.error('All parallel variables files must have the same length. %s has %d lines; %s had %d lines.', State.pvar[0].varname, nlines0, p.varname, nlines1)
+            sys.exit(1)
+        
+
+def do_clean():
+    '''First, clean all experiment directories by simply calling srs-go with -cleanall or -cleandata on each exp directory. Then, if -cleanall, also remove yourself.'''
+    cmd = 'srs-go %s -dir %s/tasks/%%s'%(State.operation, State.topdir)
+        
+    ret = 0 # 0 is success, 1 is fail
+    for f in os.listdir(os.path.join(State.topdir, 'tasks')):
+        if re.match(r'task[0-9]+$', f):
+            logging.debug('Cleaning %s', f)
+            ret = ret | subprocess.call(cmd%(f), shell=True)
+
+    if ret != 0:
+        logging.error('Cleaning of an experiment subdirectory failed.')
+
+    if State.operation == '-cleanall':
+        try:
+            shutil.rmtree(State.topdir)
+        except OSError as err:
+            logging.error('Unable to delete %s: %s', State.topdir, err.strerror)
+            sys.exit(1)
+
+    if ret != 0:
+        sys.exit(1)
+    
+def nlines_in_file(path):
+    '''Return the number of lines in a file'''
+    nlines = 0
+    with open(path) as f:
+        for line in f:
+            nlines += 1
+    return nlines
+
+def setup_logging():
+    '''Setup python logging'''
+    numeric_level = getattr(logging, State.loglevel, None)
+    if not isinstance(numeric_level, int):
+        raise ValueError('Invalid log level: %s' % loglevel)
+    logging.basicConfig(level=numeric_level, format="%(module)s:%(levelname)s: %(message)s")
+
+def make_subdir(d):
+    '''Make a directory if it doesn't already exist.'''
+    if not os.path.exists(d):
+        try:
+            os.makedirs(d)
+        except OSError as err:
+            logging.error('Could not make directory %s: %s', d, err.errstr)
+            sys.exit(1)
+
+def parse_arguments(strs):
+    parser = argparse.ArgumentParser(description='System for Running Parallel Systems v%s'%VERSION)
+
+    parser.add_argument('-config', dest='configfile', default='/dev/null',
+                        help='Initial configuration file. Also used to configure srs-go and srs-go-parallel.')
+    parser.add_argument('-template', default=None,
+                        help='Source template directory')
+    parser.add_argument('-dir', dest='topdir', default='.',
+                        help='Top level working directory (defaults to current directory)')
+    parser.add_argument('-from', dest='fromstep',
+                        help='First step to execute')
+    parser.add_argument('-to', dest='tostep',
+                        help='Last step to execute')
+    parser.add_argument('-loglevel', 
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        default='WARNING',
+                        help='Logging level (default %(default)s)')
+    parser.add_argument('-cleandata', action='store_true', help='Remove everything under all data directories')
+    parser.add_argument('-cleanall', action='store_true', help='Remove everything, including under the data directories')
+    parser.add_argument('-pvar', nargs=2, action='append', metavar=('VAR','FILE'), help='Variable to parallelize over and the file from which to read it.')
+    parser.add_argument('-attr', default=[], action='append', help='Extra arguments passed to run-command with -attr')
+    parser.add_argument('-batchsize', type=int, default=10, help='Number of tasks per batch')
+    parser.add_argument('-njobs', type=int, default=12, help='Number of batches to run in parallel')
+    parser.add_argument('-exit-on-error', dest='exit_on_error', action='store_true', help='Stop running immediately upon a task failure.')
+    parser.add_argument('-preserve', choices=['none', 'errors', 'all'], default='errors', help='If none, all task directories are cleaned as they complete. If errors, task directories that return exit code 0 are cleaned as they complete, but directories with non-zero exit code are preserved. If all, no cleanup occurs. Defaults to %(default)s.')
+    parser.add_argument('-version', '--version', action='version', version="%s $Id: srs-go-parallel 625 2013-09-24 21:46:06Z janin $"%VERSION)
+    parser.add_argument('-singleMachine', default='False', help='set True if it runs on single machine. Default value is False')
+    parser.add_argument('extraconfig', nargs='*', metavar='VAR VAL', help='Extra config variables/values set before all others.')
+
+    args = parser.parse_args(strs)
+    
+    # Set up python logging (not srs logging)
+    State.loglevel = args.loglevel
+    setup_logging()
+
+    if not args.cleanall and not args.cleandata:
+        if args.template is None:
+            logging.error('Missing required -template templatedir')
+            sys.exit(1)
+        else:
+            State.template = os.path.abspath(args.template)
+
+    State.topdir = os.path.abspath(args.topdir)
+    State.configfile = os.path.abspath(args.configfile)
+    State.fromstep = args.fromstep
+    State.tostep = args.tostep
+    State.extraconfig = args.extraconfig
+    if len(State.extraconfig) % 2 != 0:
+        logging.error('Must provide key value pairs for extra config variables.')
+        sys.exit(1)
+    State.batchsize = args.batchsize
+    State.njobs = args.njobs
+    State.exit_on_error = args.exit_on_error
+    State.preserve = args.preserve
+    State.singleMachine = args.singleMachine
+
+    State.pvar = []
+    if args.pvar is not None:
+        for (varname, filename) in args.pvar:
+            State.pvar.append(PVar(varname, filename))
+
+    State.extra_attrs = args.attr
+
+    if args.cleanall:
+        State.operation = '-cleanall'
+    elif args.cleandata:
+        State.operation = '-cleandata'
+    else:
+        State.operation = None
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

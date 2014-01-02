@@ -1,0 +1,15 @@
+Test of retries for both failure and timeouts.
+
+The template writes a "3" to a temp file in step010.init.
+
+In step020.fail3times, the number is read from the temp file,
+decremented, and written back to the temp file.
+
+If the count reaches 0, the step fails.
+
+In other words, if step020.fail3times is called 4 times, the final time
+will succeed.
+
+step040.timeout3times also reads and decrements a temp file, but
+it will simply sleep for 10 seconds if the count is above 3 and
+not sleep otherwise.

@@ -1,0 +1,181 @@
+#!/bin/sh
+# wrapper used to run remote jobs
+#
+# $Header: /u/drspeech/opt/eval2000/system/bin/RCS/run-command,v 1.6 2012/10/12 00:59:05 stolcke Exp $
+#
+
+EVAL2000=${EVAL2000-/u/drspeech/opt/eval2000/system}
+export EVAL2000
+
+# find attribute to select binary-compatible machines
+case "$MACHINE_TYPE" in
+sparc-elf*)	arch=sparc_v8 ;;
+sparc*)		arch=sparc_v7 ;;
+mips*)		arch=iris ;;
+*)		arch=`uname -m` ;;
+esac
+
+rexport=${RUN_COMMAND_REXPORT-rexport}
+metadb=$EVAL2000/bin/metadb
+config=$EVAL2000/config/run-command.config
+
+######
+## if system does not have pmake but has gnumake
+if ! pmake_var="$(type -p "pmake")" || [ -z "$pmake_var" ]; then
+	if gnumake_var="$(type -p "gnumake")" && [ -n "$gnumake_var" ] ; then
+		rexport=${RUN_COMMAND_REXPORT-rexport.gnumake}
+	elif make_var="$(type -p "make")" && [ -n "$make_var" ] ; then
+		rexport=${RUN_COMMAND_REXPORT-rexport.gnumake}
+	else 
+		echo "The system must have either pmake or gnumake" >>$logfile 2>&1
+		exit $status
+	fi
+fi
+
+
+if [ -n "$RUN_COMMAND_DELAY" ]; then
+	delay=$RUN_COMMAND_DELAY
+fi
+
+#
+# find user-specific attributes
+#
+if [ -x "$metadb" -a -f "$config" ]; then
+	userattr=`$metadb -config $config ${USER-$LOGNAME}_attr`
+	if [ -z "$userattr" ]; then
+		userattr=`$metadb -config $config DEFAULT_attr`
+	fi
+
+	njobs=`$metadb -config $config njobs`
+	if [ -z "$delay" ]; then
+		delay=`$metadb -config $config delay`
+	fi
+	if [ -z "$RUN_COMMAND_REXPORT" ]; then
+	    rexport=`$metadb -config $config rexport`
+	    if [ -z "$rexport" ]; then
+		    rexport=rexport
+	    fi
+	fi
+	no_check_exec=`$metadb -config $config no_check_exec`
+fi
+
+if [ -z "$njobs" ]; then
+	njobs=8
+fi
+
+if [ -z "$delay" ]; then
+	delay=0
+fi
+
+if [ -w /dev/fd/1 ]; then
+	logfile=/dev/fd/1
+elif [ -w /dev/stdout ]; then
+	logfile=/dev/stdout
+else
+	logfile=run-command.log
+fi
+
+pass_options=
+notify_user=
+kickme="kickme run"
+
+while [ $# -gt 1 ]
+do
+	case "$1" in
+	-log)	logfile=$2;
+		shift; shift;;
+	-attr)	attr="$attr $2";
+		shift; shift;;
+	-check-exec)
+		if [ -z "$no_check_exec" ]; then
+		    pass_options="$pass_options $1";
+		fi
+		shift ;;
+	-exit-on-error)
+		pass_options="$pass_options $1";
+		shift ;;
+	-notify)
+		notify_user=`whoami`;
+		shift ;;
+	-notsame)	
+		arch=
+		kickme=
+		shift;;
+	-f)	script=$2;
+		shift; shift;;
+	-J)	njobs=$2;
+		shift; shift;;
+	-*)	echo "unknown $1 option "
+		exit 1;;
+	*)	break;;
+	esac
+done
+
+# attributes required of all jobs
+min_attr="$arch $userattr"
+
+# hack: add minumum attributes into every disjunct of the -attr expression
+attr=`echo $min_attr $attr | sed "s, OR , OR $min_attr ,g" `
+
+# Truncate the log file at 0 now and only append from here on
+# (avoid doing this for stdout, in case it is redirected to file)
+#
+case $logfile in
+/dev/*) ;;
+*)	>$logfile ;;
+esac
+
+#
+# guard against recursive exporting of commands
+#
+if [ -n "$RUN_COMMAND" ]; then
+	echo "$0: recursive invocation from $RUN_COMMAND; running commands locally!" >&2
+
+	# don't attempt to redirect to /dev/stdout,
+	# (fails on linux if already redirected in the environment)
+	case "$logfile" in
+	/dev/stdout|/dev/fd/1) ;;
+	*)	exec >> $logfile 2>&1 ;;
+	esac
+
+	if [ -n "$script" ]; then
+		exec sh "$script"
+	else
+		exec sh -c "$*"
+	fi
+fi
+
+RUN_COMMAND="$$@`hostname`"
+export RUN_COMMAND
+
+#
+# run either a script or a single command
+#
+if [ -n "$script" ]; then
+	command="$script"
+	echo "Running rexport -f $script" >> $logfile
+	$rexport -attr "$attr" -J $njobs -delay $delay $pass_options -f "$script" >>$logfile 2>&1
+	status=$?
+else
+	command="$1"
+	shift
+	echo "$kickme $command $@" >> $logfile
+	$rexport -attr "$attr" -J $njobs $pass_options $kickme "$command" "$@" \
+								>>$logfile 2>&1
+	status=$?
+fi
+
+if [ $status -ne 0 ]; then
+	echo "*** $command failed with status $status;" >&2
+	echo "*** examine output in $logfile." >&2
+fi
+
+if [ -n "$notify_user" ]; then
+	Mail -s "Process completion notification" $notify_user <<.
+$command completed with status $status
+in directory `pwd` 
+on `date`.
+.
+fi
+exit $status
+

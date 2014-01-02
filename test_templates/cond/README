@@ -1,0 +1,26 @@
+NOTE: This has not yet been implemented in srs-go.
+
+Imagine somebody has written a QuickNet template called train_mlp_quicknet and somebody else has written a TNet train_mlp_tnet, and you want to run one OR the other. The current way of doing this in SRS is to write two templates, but this leads to a combinatoric explosion if you have many such conditionals.
+
+I'd like it to be obvious from the template that some steps are conditional (rather than being hidden within a step). I would also like the "ls" order to be preserved.
+
+Here's an example:
+
+----------------------------------------------------------------------
+> ls train_mlp                 | Contents of file:
+                               |
+step010.mlp.CASE.net_library   | (Empty file)
+step010.mlp.DEFAULT            | (File step; report error and fail)
+step010.mlp.WHEN.qn            | (Symlink to train_mlp_quicknet)
+step010.mlp.WHEN.tn            | (Symlink to train_mlp_tnet)
+----------------------------------------------------------------------
+
+"step010.mlp.CASE.net_library" is a normal step or an empty file. When srs-go finishes executing it, it looks up "net_library" in the current config chain. If net_library is equal to "qn", step010.mlp.WHEN.qn is executed. Likewise, if it's "tn", then step010.mlp.WHEN.tn is executed. Otherwise, step010.mlp.DEFAULT is executed.
+
+This is a bit weird, since we're starting to encode a programming language by file names, but I think it solves the problem elegantly.
+
+Thoughts?
+
+   Adam
+
+P.S. We're already punting on the locale issue - if any filename has non-ascii character, srs-go reports an error and die.

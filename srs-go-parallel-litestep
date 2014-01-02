@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+# $Id: srs-go-parallel-litestep 625 2013-09-24 21:46:06Z janin $
+# Copyright 2012, 2013 International Computer Science Institute
+# See the file LICENSE for licensing terms.
+#
+
+DESCRIPTION="""
+A lightweight version of srs-go-parallel.  This can only run a
+template that must satisfy the following conditions:
+
+ - contains one step, and it's a file-step
+ - the file-step can read a streaming config ($1 = /dev/stdin)
+ - the file-step will not write out a config ($2 = /dev/null)
+ - data is written external to the template (i.e. not in SRS-GO/data)
+ - the step should not assume template-local paths (e.g. default.config)
+
+Unlike srs-go-parallel, this tool does not invoke srs-go and does not
+create any experiment directories.  Instead, it merely replicates the
+convenient -pvar interface of srs-go-parallel and wraps run-command in
+a streaming manner without the need for intermediate disk access.
+
+A runtime heuristic may be provided, by specifying a command which is
+applied to each value of a given parallel variable (pvar).  The
+command should return a numeric value that positively correlates to
+the expected runtime of the task.  This is used to sort tasks in
+decreasing order of runtime, so that distributed computation is better
+allocated (largest inputs should be allocated to fastest machines,
+while any late stragglers should be short-running).
+"""
+
+import argparse
+import logging
+import os
+import sys
+import subprocess
+import srs
+import StringIO
+
+# Parse arguments
+parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 description=DESCRIPTION)
+parser.add_argument('-config', dest='configfile', default='/dev/null', 
+                    help='Initial configuration file.')
+parser.add_argument('-template', default=None,
+                    help='Source template directory (must contain only one file-step)')
+parser.add_argument('-loglevel', 
+                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                    default='WARNING',
+                    help='Logging level (default %(default)s)')
+parser.add_argument('-pvar', nargs=2, action='append', metavar=('VAR','FILE'), 
+                    help='Variable to parallelize over and the file from which to read it.')
+parser.add_argument('-batchsize', type=int, default=10, 
+                    help='Number of tasks per batch')
+parser.add_argument('-njobs', type=int, default=12, 
+                    help='Number of batches to run in parallel')
+parser.add_argument('-attr', default=[], action='append', 
+                    help='Extra arguments passed to run-command with -attr')
+parser.add_argument('-exit-on-error', dest='exit_on_error', action='store_true',
+                    help='Stop running immediately upon a task failure.')
+parser.add_argument('-stream-config', dest='stream_config', action='store_true', 
+                    help='Dump and stream all config variable declarations.')
+parser.add_argument('-runtime-heuristic', dest='runtime_heuristic', default=None,
+                    nargs=2, metavar=('PVAR', 'COMMAND'), 
+                    help='Apply COMMAND to PVAR to provide a numeric estimate of runtime.')
+parser.add_argument('-version', '--version', action='version', version='$Id: srs-go-parallel-litestep 625 2013-09-24 21:46:06Z janin $')
+##### if it runs on single machine, set this value True.
+parser.add_argument('-singleMachine', default='False', help='set True if it runs on single machine. Default value is False')
+parser.add_argument('extraconfig', nargs='*', metavar='VAR VAL', 
+                    help='command-line variables/values to override -config option.')
+args = parser.parse_args()
+
+# Setup logging, redirecting run-command's stdout/stderr
+numeric_level = getattr(logging, args.loglevel, None)
+if not isinstance(numeric_level, int):
+    raise ValueError('Invalid log level: %s' % loglevel)
+logging.basicConfig(level=numeric_level, format="%(module)s:%(levelname)s: %(message)s")
+
+# Get system limit for command-line arguments
+try:
+    sp = subprocess.Popen('expr `getconf ARG_MAX` - `env|wc -c` - `env|wc -l` \* 4 - 2048', shell=True, stdout=subprocess.PIPE)
+    ARG_MAX = int(sp.communicate()[0])
+except:
+    logging.warning("Couldn't get ARG_MAX; set to 4096")
+    ARG_MAX = 4096
+
+# Get the file-step
+templatedir = os.path.abspath(args.template)
+if not os.path.exists(templatedir):
+    logging.error("could not find template directory: %s" % templatedir)
+    sys.exit(1)
+steps = filter(lambda s: s[:4] == 'step' and s[-1] != '~', os.listdir(templatedir))
+if len(steps) != 1:
+    logging.error("did not find exactly one step: %s" % steps)
+    sys.exit(1)
+filestep = os.path.join(templatedir, steps[0])
+if not os.path.isfile(filestep):
+    logging.error("step is not a file: %s" % filestep)
+    sys.exit(1)
+logging.info("found file-step: %s" % filestep)
+
+# Parse extra config variables
+if len(args.extraconfig) % 2:
+    logging.error('improper number of extra config arguments')
+    sys.exit(1)
+extraconfig = [tuple(args.extraconfig[i:i+2]) for i in range(0, len(args.extraconfig), 2)]
+
+# Load the pvars into task environments
+declarations = []
+for pvar, pvarfile in args.pvar:
+    values = open(pvarfile).read().strip().split('\n')
+    declarations.append([(pvar, v) for v in values])
+task_envs = zip(*declarations)
+
+# Sort tasks by runtime heuristic
+if args.runtime_heuristic is not None:
+    pvar, command = args.runtime_heuristic
+    def runtime_heuristic(task_env):
+        task_env = dict(task_env)
+        value = task_env[pvar]
+        heuristic = float(subprocess.check_output(command + ' ' + value, shell=True))
+        return -1 * heuristic
+    task_envs.sort(key=runtime_heuristic)
+
+# Load the entire config into one big string
+cfg = srs.Config(args.configfile)
+cfg_f = StringIO.StringIO()
+cfg.write(cfg_f)
+cfg_f.seek(0)
+cfg_lines = cfg_f.readlines()
+cfg_f.close()
+
+# Build the script input to run-command, one line per task
+cmds = []
+for task_env in task_envs:
+    cmd = '('                   
+    for key, value in extraconfig:
+        cmd += "echo %s %s; " % (key, value)
+    for pvar, value in task_env:
+        cmd += "echo %s %s; " % (pvar, value)
+    if args.stream_config:
+        for line in cfg_lines:
+            cmd += "echo '%s' '%s'; " % tuple(line.strip().split(None, 1))
+    else:
+        cmd += "echo INCLUDE %s" % os.path.abspath(args.configfile)
+    cmd += ") | %s /dev/stdin /dev/null" % filestep
+    cmds.append(cmd)
+
+# Join commands into one line (or more, if too long)
+def batch_commands(cmds):
+    if args.exit_on_error:
+        batched_cmd = "sh -e -c \"%s\"" % '; '.join(cmds)
+    else:
+        batched_cmd = "sh -c '%s'" % '; '.join(cmds)
+    if len(batched_cmd) < ARG_MAX:
+        return [batched_cmd]
+    else:
+        if len(cmds) <= 0:
+            logging.error("Command is longer than ARG_MAX: %d =< %d" %
+                          (ARG_MAX, len(batched_cmd)))
+        else:
+            half = len(cmds)/2
+            logging.info("New batch_sizes = %d,%d (ARG_MAX: %d =< %d)" % 
+                         (half, len(cmds)-half, ARG_MAX, len(batched_cmd)))
+            return batch_commands(cmds[:half+1]) + batch_commands(cmds[half+1:]) 
+batched_cmds = []
+for i in range(0, len(cmds), args.batchsize):
+    batched_cmds += batch_commands(cmds[i:i+args.batchsize])
+
+# Fork a run-command subprocess
+runcmd_cmd = 'run-command -f /dev/stdin'
+########
+## if it runs on single machine, use run-command.vm
+if args.singleMachine.lower() == 'true':
+    runcmd_cmd = 'run-command.vm -f /dev/stdin'
+
+for attr in args.attr:
+    if attr:
+        runcmd_cmd += ' -attr ' + attr 
+if args.exit_on_error:
+    runcmd_cmd += ' -exit-on-error'
+runcmd_cmd += " -J %d" % args.njobs
+runcmd_proc = subprocess.Popen(runcmd_cmd, shell=True, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+logging.info(runcmd_cmd)
+
+# Communicate with the subprocess (buffering all of stdout and stderr)
+(stdout_str, stderr_str) = runcmd_proc.communicate('\n'.join(batched_cmds))
+
+# Log appropriately
+for line in filter(bool, stdout_str.strip().split('\n')):
+    if runcmd_proc.returncode != 0:
+        logging.error('run-command:stdout: ' + line)
+    else:
+        logging.debug('run-command:stdout: ' + line)
+for line in filter(bool, stderr_str.strip().split('\n')):
+    if runcmd_proc.returncode != 0:
+        logging.error('run-command:stderr: ' + line)
+    else:
+        logging.warning('run-command:stderr: ' + line)
+
+# Exit with run-command's return code
+sys.exit(runcmd_proc.returncode)

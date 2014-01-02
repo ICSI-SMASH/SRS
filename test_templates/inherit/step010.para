@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+{
+set -o nounset
+set -o errexit
+set -o pipefail
+
+inconfig=$1
+outconfig=$2
+
+seq 3 > vars
+
+srs-go-parallel -template ../retry -dir runpara -pvar dummy vars
+
+exit
+}
